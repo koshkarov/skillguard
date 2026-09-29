@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -12,7 +13,7 @@ from .skill import Skill, numbered
 
 CONTEXT_LINES = 25
 MAX_STATE_CHARS = 60_000
-MAX_TRIAGED = 80
+MAX_TRIAGED = 1000  # safety limit; exceeding it is reported and fails the layer
 KEEP_THRESHOLD = 0.2    # P(true_positive) at or above this always keeps the finding
 DROP_THRESHOLD = 0.6    # P(false_positive) at or above this removes it
 
@@ -53,48 +54,73 @@ def _state(skill: Skill, finding: Finding) -> str:
     return state[:MAX_STATE_CHARS]
 
 
-def _judge(skill: Skill, finding: Finding) -> dict:
+def validate_answer(answer: object) -> dict:
+    """Check a Jev choice answer; return {verdict, probabilities} or raise ValueError."""
+    if not isinstance(answer, dict) or answer.get("choice") not in CRITERIA:
+        raise ValueError(f"unexpected choice: {str(answer)[:120]}")
+    probs = answer.get("probabilities")
+    if not isinstance(probs, dict) or set(probs) != set(CRITERIA):
+        raise ValueError(f"probabilities missing or incomplete: {str(probs)[:120]}")
+    for key, value in probs.items():
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"invalid probability {key}={value!r}")
+    if not 0.9 <= sum(probs.values()) <= 1.1:
+        raise ValueError(f"probabilities do not sum to 1: {probs}")
+    return {"verdict": answer["choice"], "probabilities": {k: float(v) for k, v in probs.items()}}
+
+
+def decide(severity: str, result: dict) -> str:
+    """Shared keep/remove/downgrade policy (also used by tools/jev_filter.py).
+
+    Returns "keep", "remove" or "downgrade". Anything but a validated answer keeps the finding as is.
+    """
+    probs = result.get("probabilities")
+    if result.get("verdict") not in CRITERIA or not isinstance(probs, dict):
+        return "keep"
+    if probs["true_positive"] >= KEEP_THRESHOLD:
+        return "keep"
+    if probs["false_positive"] >= DROP_THRESHOLD:
+        return "remove"
+    return "downgrade" if severity_rank(severity) > severity_rank("LOW") else "keep"
+
+
+def judge_state(state: str) -> dict:
+    """Ask Jev about one finding. Returns a validated result, or {"verdict": "error", ...}."""
     try:
-        response = jev(_state(skill, finding), {
+        response = jev(state, {
             "verdict": {"type": "choice", "instructions": "Classify this scanner finding.", "criteria": CRITERIA}
         })
-        answer = response["answers"]["verdict"]
-    except (LLMError, KeyError, TypeError) as exc:
+        result = validate_answer((response.get("answers") or {}).get("verdict"))
+    except (LLMError, ValueError, AttributeError, TypeError) as exc:
         return {"verdict": "error", "error": str(exc)[:200], "cost": 0.0}
-    return {
-        "verdict": answer.get("choice"),
-        "probabilities": answer.get("probabilities", {}),
-        "cost": (response.get("usage") or {}).get("cost", 0.0) or 0.0,
-    }
+    result["cost"] = float((response.get("usage") or {}).get("cost") or 0.0)
+    return result
 
 
 def apply(finding: Finding, result: dict) -> None:
     finding.triage = result
-    if result["verdict"] == "error":
-        return  # fail closed: keep as is
-    probs = result.get("probabilities", {})
-    p_tp, p_fp = probs.get("true_positive", 0.0), probs.get("false_positive", 0.0)
-    if p_tp >= KEEP_THRESHOLD:
-        return
-    if p_fp >= DROP_THRESHOLD:
+    action = decide(finding.severity, result)
+    if action == "remove":
         finding.status = "removed"
-    elif severity_rank(finding.severity) > severity_rank("LOW"):
+    elif action == "downgrade":
         finding.original_severity, finding.severity, finding.status = finding.severity, "LOW", "downgraded"
 
 
 def run(skill: Skill, findings: list[Finding], workers: int = 8) -> LayerStatus:
     started = time.monotonic()
-    targets = [f for f in findings if not f.precise and f.source != "semantic"][:MAX_TRIAGED]
+    eligible = [f for f in findings if not f.precise and f.source != "semantic"]
+    targets, skipped = eligible[:MAX_TRIAGED], len(eligible) - MAX_TRIAGED
     if not targets:
         return LayerStatus("triage", True, "nothing to triage", 0.0)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        results = list(pool.map(lambda f: _judge(skill, f), targets))
+        results = list(pool.map(lambda f: judge_state(_state(skill, f)), targets))
     for finding, result in zip(targets, results):
         apply(finding, result)
-    errors = sum(r["verdict"] == "error" for r in results)
-    status = LayerStatus(
-        "triage", errors == 0,
-        f"{len(targets)} judged, {errors} errors" + (f"; first error: {next(r['error'] for r in results if r['verdict'] == 'error')}" if errors else ""),
-        time.monotonic() - started, sum(r["cost"] for r in results),
-    )
-    return status
+    errors = [r for r in results if r["verdict"] == "error"]
+    detail = f"{len(targets)} judged, {len(errors)} errors"
+    if errors:
+        detail += f"; first error: {errors[0]['error']}"
+    if skipped > 0:
+        detail += f"; {skipped} finding(s) over the limit of {MAX_TRIAGED} kept untriaged"
+    return LayerStatus("triage", not errors and skipped <= 0, detail, time.monotonic() - started,
+                       sum(r["cost"] for r in results))

@@ -65,3 +65,4 @@ class LayerStatus:
     detail: str = ""
     seconds: float = 0.0
     cost: float = 0.0
+    skipped: bool = False   # disabled by the user; counts as "did not run" for the verdict

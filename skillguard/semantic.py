@@ -94,45 +94,89 @@ def is_data_file(path: str, size: int) -> bool:
     return any(lower.endswith(s) for s in DATA_SUFFIXES) or (lower.endswith(".json") and size > DATA_JSON_BYTES)
 
 
-def _block(file, nonce: str) -> str:
-    return f"\n<<<FILE {nonce} path={file.path}>>>\n{numbered(file)}\n<<<END FILE {nonce}>>>\n"
+MANIFEST_CONTEXT_CHARS = 60_000  # SKILL.md text repeated in every chunk; the rest is reviewed as its own parts
+MAX_LINE_CHARS = 20_000          # a single longer line is split across parts
 
 
-def build_prompts(skill: Skill, hints: list[Finding], nonce: str) -> tuple[list[str], list[str], list[str]]:
-    """Split the skill into prompts that fit the budget.
+def _parts(file, nonce: str, limit: int) -> list[str]:
+    """Render a file as one or more framed blocks, each at most `limit` characters, split on line ranges."""
+    whole = f"\n<<<FILE {nonce} path={file.path}>>>\n{numbered(file)}\n<<<END FILE {nonce}>>>\n"
+    if len(whole) <= limit:
+        return [whole]
+    lines = []  # (line number, text) with over-long lines cut into pieces
+    for number, text in enumerate(file.lines, 1):
+        for i in range(0, max(1, len(text)), MAX_LINE_CHARS):
+            lines.append((number, text[i: i + MAX_LINE_CHARS]))
+    blocks, start, body = [], 0, []
+    frame = 120 + len(file.path)  # room for the part header/footer
+    for index, (number, text) in enumerate(lines):
+        row = f"{number:5d}| {text}"
+        if body and sum(len(r) + 1 for r in body) + len(row) + frame > limit:
+            blocks.append((lines[start][0], lines[index - 1][0], body))
+            start, body = index, []
+        body.append(row)
+    blocks.append((lines[start][0], lines[-1][0], body))
+    return [f"\n<<<FILE {nonce} path={file.path} lines={a}-{b} (part {i + 1} of {len(blocks)})>>>\n"
+            + "\n".join(rows) + f"\n<<<END FILE {nonce}>>>\n" for i, (a, b, rows) in enumerate(blocks)]
 
-    Returns (prompts, data files left to Layer 1, files too large for any prompt). SKILL.md is included in
-    every prompt so each chunk knows the declared purpose.
+
+def build_prompts(skill: Skill, hints: list[Finding], nonce: str, system_chars: int = 0) -> tuple[list[str], list[str]]:
+    """Split the skill into prompts that each fit the budget (system message included).
+
+    Returns (prompts, data files left to Layer 1). Every other file is reviewed in full: large files are
+    split into line ranges. The start of SKILL.md is included in every prompt so each chunk knows the
+    declared purpose; any remainder of a large SKILL.md is reviewed as separate parts.
     """
     header = f"Skill directory name: {skill.root.name}\n"
     hint_lines = [f"- {h.rule} ({h.severity}) at {h.location}: {h.title}" for h in hints[:40]]
     if hint_lines:
         header += "Static scanner hints (may be false positives; verify against the source):\n" + "\n".join(hint_lines) + "\n"
-    skill_md = skill.get("SKILL.md")
-    base = header + (_block(skill_md, nonce) if skill_md else "")
-    prompts, data_files, too_large = [], [], []
-    current, budget = base, MAX_PROMPT_CHARS - len(base)
+    manifest = skill.manifest
+    manifest_parts = _parts(manifest, nonce, MANIFEST_CONTEXT_CHARS) if manifest else []
+    base = header + (manifest_parts[0] if manifest_parts else "")
+    capacity = MAX_PROMPT_CHARS - system_chars - len(base)
+    if capacity < 10_000:
+        raise ValueError("prompt budget too small for the skill manifest context")
+    blocks: list[str] = manifest_parts[1:]
+    data_files = []
     for file in sorted(skill.files, key=lambda f: _file_order(f.path)):
-        if is_license(file.path) or file is skill_md:
+        if is_license(file.path) or file is manifest:
             continue
         if is_data_file(file.path, len(file.text)):
             data_files.append(file.path)
             continue
-        block = _block(file, nonce)
-        if len(block) > MAX_PROMPT_CHARS - len(base):
-            too_large.append(file.path)
-            continue
-        if len(block) > budget:
+        blocks.extend(_parts(file, nonce, capacity))
+    prompts, current, used = [], base, 0
+    for block in blocks:
+        if used and used + len(block) > capacity:
             prompts.append(current)
-            current, budget = base, MAX_PROMPT_CHARS - len(base)
+            current, used = base, 0
         current += block
-        budget -= len(block)
+        used += len(block)
     prompts.append(current)
-    return prompts, data_files, too_large
+    return prompts, data_files
 
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
+
+
+EVIDENCE_WINDOW = 3  # lines either side of the cited line, to tolerate small line-number slips
+
+
+def evidence_verified(file, line: int | None, evidence: str) -> bool:
+    """The full quote must appear in the cited file, near the cited line when one is given."""
+    quote = re.sub(r"^\s*\d+\|\s?", "", evidence.strip(), flags=re.M)   # drop copied line-number prefixes
+    quote = _normalize(quote.rstrip(".…").strip())
+    if not file or len(quote) < 4:
+        return False
+    if line is None:
+        return quote in _normalize(file.text)
+    lines = file.lines
+    if not 1 <= line <= len(lines):
+        return False
+    window = lines[max(0, line - 1 - EVIDENCE_WINDOW): line + EVIDENCE_WINDOW]
+    return quote in _normalize("\n".join(window))
 
 
 def _to_findings(skill: Skill, data: dict) -> list[Finding]:
@@ -145,9 +189,9 @@ def _to_findings(skill: Skill, data: dict) -> list[Finding]:
         file_path = item.get("file")
         line = item.get("line") if isinstance(item.get("line"), int) else None
         evidence = str(item.get("evidence", ""))[:400]
-        file = skill.get(file_path) if file_path else None
-        # Anti-hallucination: the quoted evidence must exist in the cited file.
-        verified = bool(file and evidence and _normalize(evidence[:120]) in _normalize(file.text))
+        file = skill.get(file_path) if isinstance(file_path, str) else None
+        # Anti-hallucination: the full quote must exist at (or next to) the cited line.
+        verified = evidence_verified(file, line, evidence)
         finding = Finding(
             source="semantic", rule="LLM_REVIEW", ast=ast if ast in AST_NAMES else "AST01",
             severity=severity if severity in SEVERITIES else "MEDIUM",
@@ -155,11 +199,26 @@ def _to_findings(skill: Skill, data: dict) -> list[Finding]:
             why=str(item.get("why", "")), fix=str(item.get("fix", "")),
         )
         if not verified:
-            finding.triage = {"verdict": "unverified", "note": "quoted evidence not found in the cited file"}
+            finding.triage = {"verdict": "unverified", "note": "quoted evidence not found at the cited location"}
             if finding.severity in ("CRITICAL", "HIGH"):
                 finding.original_severity, finding.severity, finding.status = finding.severity, "MEDIUM", "downgraded"
         findings.append(finding)
     return findings
+
+
+REQUIRED_TEXT_FIELDS = ("declared_purpose", "actual_behavior", "summary")
+
+
+def validate_review(data: dict) -> str:
+    """Return "" if the review has every required field with the right type, else a reason."""
+    if data.get("intent") not in INTENTS:
+        return f"invalid intent {str(data.get('intent'))[:40]!r}"
+    missing = [k for k in REQUIRED_TEXT_FIELDS if not isinstance(data.get(k), str) or not data[k].strip()]
+    if missing:
+        return f"missing fields: {', '.join(missing)}"
+    if not isinstance(data.get("findings"), list):
+        return "'findings' is not a list"
+    return ""
 
 
 def _review_chunk(model: str, system: str, prompt: str) -> tuple[dict | None, dict, str]:
@@ -167,9 +226,9 @@ def _review_chunk(model: str, system: str, prompt: str) -> tuple[dict | None, di
     for _ in range(2):  # one retry on invalid output
         try:
             data, usage = chat_json(model, system, prompt)
-            if data.get("intent") in INTENTS and isinstance(data.get("findings", []), list):
+            error = validate_review(data)
+            if not error:
                 return data, usage, ""
-            error = f"invalid response fields: {sorted(data)[:8]}"
         except LLMError as exc:
             error = str(exc)[:300]
     return None, {}, error
@@ -182,12 +241,18 @@ def _cost(model: str, usage: dict) -> float:
     return usage.get("prompt_tokens", 0) * price_in / 1e6 + usage.get("completion_tokens", 0) * price_out / 1e6
 
 
-def _merge(reviews: list[dict]) -> dict:
-    """Combine chunk reviews: the worst intent wins, and its summary is used."""
+def merge_reviews(reviews: list[dict]) -> dict:
+    """Combine chunk reviews: the worst intent wins, and its summary and behavior description are used,
+    so the report never pairs a malicious verdict with a benign behavior description. Every chunk sees the
+    manifest, so the declared purpose is taken from the first."""
     worst = max(reviews, key=lambda r: INTENTS.index(r["intent"]))
-    merged = {**reviews[0], "intent": worst["intent"], "summary": worst.get("summary", "")}
-    merged["findings"] = [f for r in reviews for f in (r.get("findings") or [])]
-    return merged
+    return {
+        "declared_purpose": reviews[0]["declared_purpose"],
+        "actual_behavior": worst["actual_behavior"],
+        "intent": worst["intent"],
+        "summary": worst["summary"],
+        "findings": [f for r in reviews for f in r["findings"]],
+    }
 
 
 FALLBACK_MODEL = "openai/gpt-6-luna"
@@ -196,8 +261,8 @@ FALLBACK_MODEL = "openai/gpt-6-luna"
 def run(skill: Skill, hints: list[Finding], model: str) -> tuple[dict, list[Finding], LayerStatus]:
     started = time.monotonic()
     nonce = secrets.token_hex(6)
-    prompts, data_files, too_large = build_prompts(skill, hints, nonce)
     system = SYSTEM.format(nonce=nonce)
+    prompts, data_files = build_prompts(skill, hints, nonce, system_chars=len(system))
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda p: _review_chunk(model, system, p), prompts))
     cost = sum(_cost(model, usage) for _, usage, _ in results)
@@ -216,15 +281,13 @@ def run(skill: Skill, hints: list[Finding], model: str) -> tuple[dict, list[Find
     reviews = [data for data, _, _ in results if data is not None]
     if not reviews:
         return {}, [], LayerStatus("semantic", False, f"LLM review failed: {errors[0]}", seconds, cost)
-    review = _merge(reviews)
+    review = merge_reviews(reviews)
     detail = f"{model}, {len(prompts)} call(s), {tokens_in} in / {tokens_out} out tokens"
     if used_fallback:
         detail += f"; {len(blocked)} call(s) refused by {model}'s content filter, reviewed with {FALLBACK_MODEL}"
     if data_files:
         detail += f"; {len(data_files)} data file(s) checked by static layer only"
-    if too_large:
-        detail += f"; NOT reviewed (too large): {', '.join(too_large)}"
     if errors:
         detail += f"; {len(errors)} of {len(prompts)} call(s) failed: {errors[0]}"
-    status = LayerStatus("semantic", not too_large and not errors, detail, seconds, cost)
+    status = LayerStatus("semantic", not errors, detail, seconds, cost)
     return review, _to_findings(skill, review), status

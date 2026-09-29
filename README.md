@@ -29,24 +29,29 @@ export OPENROUTER_API_KEY=sk-or-...
 # Scan one skill
 python3 -m skillguard scan path/to/skill --md report.md --json report.json --sarif report.sarif
 
-# Static checks only (free, no API key)
+# Static checks only (free, no API key). A partial scan: it can BLOCK or REVIEW, never SAFE
 python3 -m skillguard scan path/to/skill --no-llm --no-triage
 
 # Evaluate against labeled sets
 python3 -m skillguard eval --benign path/to/benign-skills --malicious path/to/malicious-skills --out eval/
+
+# Tests (no network)
+python3 -m unittest discover -s tests
 ```
 
-Exit codes: `0` SAFE, `1` REVIEW, `2` BLOCK, so the scanner can gate CI.
+Exit codes: `0` SAFE, `1` REVIEW, `2` BLOCK, `3` error (path not scannable, no verdict), so the scanner can gate CI.
 
 Options: `--model` (any OpenRouter model; default `openai/gpt-6-luna`), `--no-llm`, `--no-triage`, `--no-cisco`.
 
-`tools/jev_filter.py` is a standalone script that filters false positives out of a SkillSpector or Cisco JSON report using Jev.
+Anything SkillGuard cannot inspect (symlinks, unknown binaries or archives, files over 2 MB, missing `SKILL.md`) is reported as a coverage gap and forces at least REVIEW.
+
+`tools/jev_filter.py` filters false positives out of a SkillSpector or Cisco JSON report using Jev, with the same decision policy as SkillGuard.
 
 ## Results so far
 
 | Test set | Result |
 |---|---|
-| 19 real, harmless skills | 0 BLOCK, 1 REVIEW, 18 SAFE |
+| 19 real, harmless skills | 0 BLOCK, 3 REVIEW, 16 SAFE (the REVIEWs: an uninspected bundled `.tar.gz`, a transient API error, and a real minor script-injection issue) |
 | 8 malicious samples ([snyk-labs/toxicskills-goof](https://github.com/snyk-labs/toxicskills-goof) + one test skill) | 8/8 BLOCK (Cisco offline alone: 2/7; SkillSpector static alone: 2/7) |
 
 This is a small evaluation, and two rules were written after seeing these samples. A larger labeled test set is the next step (see DESIGN.md §11–13).

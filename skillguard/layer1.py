@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import subprocess
 import tempfile
 import time
+from collections import Counter
 from pathlib import Path
 
-from .model import Finding, LayerStatus
+from .model import SEVERITIES, Finding, LayerStatus
 from .skill import Skill, SkillFile, is_license
 
 CISCO_PACKAGE = "cisco-ai-skill-scanner==2.1.0"
@@ -46,29 +48,49 @@ def run_cisco(skill: Skill) -> tuple[list[Finding], LayerStatus]:
             cmd.append("--lenient")  # e.g. lowercase skill.md, which Cisco otherwise rejects
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            report = json.loads(out.read_text())
-        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as exc:
+            report = json.loads(out.read_text()) if out.exists() else None
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             return [], LayerStatus("cisco", False, f"Cisco scanner failed: {exc}", time.monotonic() - started)
+    elapsed = time.monotonic() - started
+    try:
+        findings = parse_cisco_report(proc.returncode, report)
+    except ValueError as exc:
+        stderr = (proc.stderr or "").strip().splitlines()[-1:] or [""]
+        return [], LayerStatus("cisco", False, f"Cisco scanner failed: {exc} {stderr[0][:200]}".strip(), elapsed)
+    return findings, LayerStatus("cisco", True, f"{len(findings)} findings", elapsed)
+
+
+def parse_cisco_report(returncode: int, report: object) -> list[Finding]:
+    """Validate a Cisco JSON report and convert it; raise ValueError on anything unexpected."""
+    if returncode != 0:
+        raise ValueError(f"exit code {returncode}")
+    if not isinstance(report, dict) or not isinstance(report.get("findings"), list):
+        raise ValueError("report has no 'findings' list")
     findings = []
-    for f in report.get("findings", []):
-        if f.get("rule_id") == "MANIFEST_MISSING_LICENSE":
+    for index, f in enumerate(report["findings"]):
+        if not isinstance(f, dict) or not isinstance(f.get("rule_id"), str):
+            raise ValueError(f"finding {index} has no rule_id")
+        severity = str(f.get("severity", "")).upper()
+        if severity not in SEVERITIES:
+            raise ValueError(f"finding {index} has unknown severity {f.get('severity')!r}")
+        if f["rule_id"] == "MANIFEST_MISSING_LICENSE":
             continue  # licensing, not security
+        line = f.get("line_number")
         findings.append(
             Finding(
                 source="cisco",
-                rule=f.get("rule_id", "?"),
+                rule=f["rule_id"],
                 ast=CISCO_AST.get(str(f.get("category", "")).lower(), "AST01"),
-                severity=str(f.get("severity", "MEDIUM")).upper(),
-                title=f.get("title", ""),
-                file=f.get("file_path"),
-                line=f.get("line_number"),
-                evidence=(f.get("snippet") or "")[:400],
-                why=f.get("description", ""),
-                fix=f.get("remediation") or "",
+                severity=severity,
+                title=str(f.get("title") or f["rule_id"]),
+                file=f.get("file_path") if isinstance(f.get("file_path"), str) else None,
+                line=line if isinstance(line, int) else None,
+                evidence=str(f.get("snippet") or "")[:400],
+                why=str(f.get("description") or ""),
+                fix=str(f.get("remediation") or ""),
             )
         )
-    detail = f"{len(findings)} findings" + ("" if proc.returncode in (0, 1) else f" (exit {proc.returncode})")
-    return findings, LayerStatus("cisco", True, detail, time.monotonic() - started)
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +146,14 @@ def check_hidden_unicode(file: SkillFile) -> list[Finding]:
 
 BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{200,}={0,2}(?![A-Za-z0-9+/=])")
 DECODE_EXEC_RE = re.compile(r"\b(exec|eval|compile|b64decode|atob|base64\s+-d|fromCharCode|marshal\.loads|zlib\.decompress)\b")
+MIN_BASE64_ENTROPY = 4.0  # bits/char; encoded data is ~6, repeated or dictionary text is far lower
+
+
+def shannon_entropy(text: str) -> float:
+    if not text:
+        return 0.0
+    counts = Counter(text)
+    return -sum(n / len(text) * math.log2(n / len(text)) for n in counts.values())
 
 
 def check_encoded_payloads(file: SkillFile) -> list[Finding]:
@@ -133,6 +163,8 @@ def check_encoded_payloads(file: SkillFile) -> list[Finding]:
         if re.search(r"data:(image|font|audio|video)/[\w.+-]+;base64,\s*$", before):
             continue  # embedded media, e.g. images in HTML
         blob = match.group()
+        if shannon_entropy(blob) < MIN_BASE64_ENTROPY:
+            continue  # e.g. a long run of one character
         try:
             decoded = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=False)
             printable = sum(32 <= b < 127 or b in (9, 10, 13) for b in decoded[:400]) / max(1, min(400, len(decoded)))
@@ -152,14 +184,14 @@ def check_encoded_payloads(file: SkillFile) -> list[Finding]:
 
 
 CREDENTIAL_RE = re.compile(
-    r"(~|\$HOME|%USERPROFILE%|/home/\w+|/Users/\w+)?/?\.(ssh|aws|gnupg|kube|docker)/[\w./-]*"
+    r"(~|\$HOME|%USERPROFILE%|/home/\w+|/Users/\w+)?/?\.(ssh|aws|gnupg|kube|docker)(/[\w./-]*|\b)"
     r"|\bid_(rsa|ed25519|ecdsa)\b"
-    r"|\.netrc\b|\.git-credentials\b|\.pgpass\b"
+    r"|\.netrc\b|\.git-credentials\b|\.pgpass\b|\bcredentials\.json\b"
     r"|\.config/gcloud\b|\.azure/\w+"
     r"|\.claude/\.credentials|\.codex/auth\.json"
     r"|(Login Data|Cookies|Local State)\b.*(Chrome|Chromium|Brave|Edge)|(Chrome|Chromium|Brave|Edge).*\b(Login Data|Cookies)\b"
     r"|\bwallet\.dat\b|\bkeystore\b.*\.json|\bMetaMask\b"
-    r"|(?<![\w.])\.env(?![\w.-])",
+    r"|(?<![\w.])\.env(\.[\w-]+)?(?![\w-])",
     re.I,
 )
 
@@ -177,8 +209,6 @@ def check_credential_access(file: SkillFile) -> list[Finding]:
             "be touched by a skill unless its stated purpose needs them.",
             "Remove the access, or document exactly why the skill needs it and scope it to one file.",
         ))
-        if len(findings) >= 5:
-            break
     return findings
 
 
@@ -197,8 +227,6 @@ def check_agent_config_writes(file: SkillFile) -> list[Finding]:
                 "into future sessions (persistence) and can grant it more privileges.",
                 "Do not modify agent memory/config files, or require explicit user confirmation for each change.",
             ))
-            if len(findings) >= 3:
-                break
     return findings
 
 
@@ -234,20 +262,40 @@ def check_remote_instructions(file: SkillFile) -> list[Finding]:
                     "turning a safe skill malicious without any change to its files.",
                     "Inline the instructions into the skill, or pin the remote content by hash.",
                 ))
-    return findings[:5]
+    return findings
 
 
-ARCHIVE_PASSWORD_RE = re.compile(r"\.(zip|7z|rar|tar\.gz|tgz)\b.{0,160}\b(pass(word)?|pwd)\b\s*[:=]?|\b(pass(word)?|pwd)\b.{0,160}\.(zip|7z|rar)\b", re.I)
+ARCHIVE_RE = re.compile(r"\.(zip|7z|rar|tar\.gz|tgz)\b", re.I)
+PASSWORD_RE = re.compile(r"\b(pass(word)?|pwd)\b", re.I)
+DOWNLOAD_RE = re.compile(r"\bdownload|https?://", re.I)
 PASTE_SITES_RE = re.compile(r"https?://([\w-]+\.)*([\w-]*paste[\w-]*\.\w+|glot\.io|rentry\.(co|org)|ghostbin\.\w+|termbin\.com|controlc\.com|0x0\.st|transfer\.sh|webhook\.site|requestbin\.\w+|pipedream\.net)\S*", re.I)
-# A network client that sends *local* data: command output, a file, or an environment variable.
-SEND_LOCAL_DATA_RE = re.compile(
-    r"\b(curl|wget|http|Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b[^\n]*?"
-    r"(\s-d\b|--data(-\w+)?\b|\s-F\b|--form\b|\s-T\b|--upload-file\b|--post-(data|file)\b|-Body\b)"
-    r"[^\n]*?(\$\(|`[^`]*`|@[~/.\w]|\$\{?[A-Z_][A-Z0-9_]{2,}|\bcat\s)",
-    re.I,
-)
 EXECUTE_RE = re.compile(r"\b(run|execute|paste|launch|install|terminal|powershell|cmd|bash|sh)\b", re.I)
 RUN_BINARY_RE = re.compile(r"\b(download|get)\b.{0,200}\.(exe|msi|dmg|pkg|zip|appimage|bin)\b.{0,200}\b(run|execute|launch|open|install)\b", re.I)
+
+# Sending *local* data: examine each network-client command once, within a bounded span.
+NET_CLIENT_RE = re.compile(r"\b(curl|wget|http|Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b", re.I)
+COMMAND_END_RE = re.compile(r";|&&|\|\||(?<!\|)\|(?!\|)")
+MAX_COMMAND_CHARS = 600
+# Flags whose operand is always a local file.
+FILE_UPLOAD_RE = re.compile(r"(\s-T\s*|\s--upload-file[\s=]+|\s--post-file[\s=]+|-InFile\s+)[\"']?[^\s\"'-]", re.I)
+# Flags whose operand is data; it counts as local when it is command output, a file (@), an env var or `cat`.
+DATA_FLAG_RE = re.compile(r"(\s-d|\s--data(-\w+)?|\s-F|\s--form|\s--json|\s--post-data|\s-Body)[\s=]+(\S+)", re.I)
+LOCAL_DATA_RE = re.compile(r"\$\(|`|^[\"']?@[~/.\w]|=@[~/.\w]|\$\{?[A-Z_][A-Z0-9_]{2,}|\bcat\s", re.I)
+
+
+def sends_local_data(line: str) -> bool:
+    """True if a curl/wget/iwr command on this line uploads a file, command output or an env var."""
+    for match in NET_CLIENT_RE.finditer(line):
+        command = line[match.end(): match.end() + MAX_COMMAND_CHARS]
+        end = COMMAND_END_RE.search(command)
+        command = " " + (command[: end.start()] if end else command)
+        if FILE_UPLOAD_RE.search(command):
+            return True
+        for flag in DATA_FLAG_RE.finditer(command):
+            # From the operand to the end of the command: quoted payloads can contain spaces.
+            if LOCAL_DATA_RE.search(command[flag.start(3):]):
+                return True
+    return False
 
 
 def check_untrusted_installer(file: SkillFile) -> list[Finding]:
@@ -256,7 +304,7 @@ def check_untrusted_installer(file: SkillFile) -> list[Finding]:
         return []
     findings = []
     for number, line in enumerate(file.lines, 1):
-        if ARCHIVE_PASSWORD_RE.search(line):
+        if ARCHIVE_RE.search(line) and PASSWORD_RE.search(line) and DOWNLOAD_RE.search(line):
             findings.append(Finding(
                 "check", "PASSWORD_PROTECTED_DOWNLOAD", "AST01", "CRITICAL",
                 "Tells the user to download a password-protected archive", file.path, number, line.strip()[:300],
@@ -264,7 +312,7 @@ def check_untrusted_installer(file: SkillFile) -> list[Finding]:
                 "Legitimate skills do not need this. It is the delivery method of known malicious skill campaigns.",
                 "Do not download or run it. Remove the skill.", precise=True,
             ))
-        elif SEND_LOCAL_DATA_RE.search(line):
+        elif sends_local_data(line):
             to_paste = bool(PASTE_SITES_RE.search(line))
             findings.append(Finding(
                 "check", "INSTRUCTION_SENDS_LOCAL_DATA", "AST01", "CRITICAL" if to_paste else "HIGH",
@@ -290,7 +338,7 @@ def check_untrusted_installer(file: SkillFile) -> list[Finding]:
                 "Running a downloaded binary as a 'prerequisite' gives unreviewed code full access to the machine.",
                 "Install dependencies from a trusted package manager, pinned and verified.",
             ))
-    return findings[:5]
+    return findings
 
 
 SECRET_PATTERNS = {
@@ -316,7 +364,6 @@ def check_secrets(file: SkillFile) -> list[Finding]:
                 "A secret shipped inside a skill is exposed to everyone who installs it and may be abused.",
                 "Remove the secret, rotate it, and read credentials from the environment at runtime.",
             ))
-            break
     return findings
 
 
@@ -340,7 +387,7 @@ def check_unsafe_deserialization(file: SkillFile) -> list[Finding]:
                 "Loading untrusted data with pickle/marshal/unsafe YAML can execute arbitrary code.",
                 "Use yaml.safe_load / json, or only deserialize data the skill created itself.",
             ))
-    return findings[:3]
+    return findings
 
 
 INSTALL_HOOKS = ("preinstall", "install", "postinstall", "prepare")
@@ -417,22 +464,19 @@ BRANDS = ["anthropic", "openai", "google", "microsoft", "github", "aws", "amazon
 
 def check_metadata(skill: Skill) -> list[Finding]:
     findings = []
-    if not skill.get("SKILL.md"):
-        findings.append(Finding("check", "NO_SKILL_MD", "AST04", "MEDIUM", "No SKILL.md manifest", None, None, "",
-                                "Without a manifest the skill's purpose cannot be checked against its behavior.",
-                                "Add a SKILL.md with name and description.", precise=True))
-        return findings
+    if not skill.manifest:
+        return findings  # reported as a coverage gap by the loader
     for key in ("name", "description"):
         if not skill.frontmatter.get(key):
             findings.append(Finding("check", f"MISSING_{key.upper()}", "AST04", "LOW", f"Frontmatter has no `{key}`",
-                                    "SKILL.md", 1, "", "The declared purpose is needed to judge behavior.",
+                                    skill.manifest.path, 1, "", "The declared purpose is needed to judge behavior.",
                                     f"Add a `{key}` field to the frontmatter.", precise=True))
     name = skill.frontmatter.get("name", "").lower()
     brand = next((b for b in BRANDS if re.search(rf"\b{b}\b", name)), None)
     if brand or "official" in name:
         findings.append(Finding(
             "check", "BRAND_IN_NAME", "AST04", "MEDIUM", f"Skill name uses a brand or 'official': {skill.frontmatter.get('name')}",
-            "SKILL.md", 1, f"name: {skill.frontmatter.get('name')}",
+            skill.manifest.path, 1, f"name: {skill.frontmatter.get('name')}",
             "Fake branded skills are a common way to gain trust for malicious skills.",
             "Confirm the publisher is affiliated with the brand before installing.",
         ))
@@ -456,9 +500,16 @@ def run_own_checks(skill: Skill) -> tuple[list[Finding], LayerStatus]:
             findings.extend(check(file))
     if skill.binary_files:
         findings.append(Finding(
-            "check", "UNREVIEWABLE_FILES", "AST08", "LOW", f"{len(skill.binary_files)} binary or oversized file(s) not inspected",
+            "check", "MEDIA_FILES", "AST08", "LOW", f"{len(skill.binary_files)} media/font/document file(s) not inspected",
             None, None, ", ".join(skill.binary_files[:10]),
-            "Binary files cannot be reviewed as text and may hide executables.",
-            "Check these files manually or remove them if they are not needed.", precise=True,
+            "Binary assets cannot be reviewed as text. These have ordinary media types.",
+            "Remove any that the skill does not need.", precise=True,
+        ))
+    for gap in skill.coverage_gaps:
+        findings.append(Finding(
+            "check", "COVERAGE_GAP", "AST08", "MEDIUM", f"Not inspected: {gap}",
+            gap.split(":")[0].rstrip("/") or None, None, gap,
+            "Content that SkillGuard could not inspect may hide anything, so the skill cannot be cleared automatically.",
+            "Inspect it manually, or remove it from the skill.", precise=True,
         ))
     return findings, LayerStatus("checks", True, f"{len(findings)} findings", time.monotonic() - started)

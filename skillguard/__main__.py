@@ -16,8 +16,10 @@ from pathlib import Path
 
 from . import report
 from .scanner import DEFAULT_MODEL, scan
+from .skill import SkillLoadError
 
 EXIT = {"SAFE": 0, "REVIEW": 1, "BLOCK": 2}
+EXIT_ERROR = 3  # nothing could be scanned; no verdict issued
 
 
 def _scan_args(args) -> dict:
@@ -26,7 +28,11 @@ def _scan_args(args) -> dict:
 
 
 def cmd_scan(args) -> int:
-    result = scan(Path(args.path), **_scan_args(args))
+    try:
+        result = scan(Path(args.path), **_scan_args(args))
+    except SkillLoadError as exc:
+        print(f"ERROR: {exc}; no verdict issued.", file=sys.stderr)
+        return EXIT_ERROR
     markdown = report.to_markdown(result)
     if args.md:
         Path(args.md).write_text(markdown)

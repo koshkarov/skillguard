@@ -23,45 +23,25 @@ Usage:
     skill-scanner scan <skill> --use-behavioral --format json --output cisco.json
     python jev_filter.py cisco.json -o filtered.json --md filtered.md
 
-Auth: OPENROUTER_API_KEY, or SKILLSPECTOR_COMPAT_API_KEY from skills/.env.
-Stdlib only; no pip installs needed.
+Auth: OPENROUTER_API_KEY. Stdlib only; uses the Jev validation and decision policy from the
+skillguard package in this repo, so both tools always treat Jev answers the same way.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-API_URL = "https://openrouter.ai/api/v1/systemone"
-DEFAULT_MODEL = "typesafe/jev-1.13"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for the skillguard package
+from skillguard import openrouter, triage  # noqa: E402  shared Jev call, validation and decision policy
+
 CONTEXT_LINES = 25          # source lines shown before/after the finding
 MAX_STATE_CHARS = 60_000    # Jev limit is ~64k tokens total; stay well under
-
-VERDICT_CRITERIA = {
-    "true_positive": (
-        "Real malicious or dangerous behavior: exfiltration, credential theft, "
-        "prompt injection, hidden or undisclosed destructive actions, "
-        "remote code download/execution, or clear abuse of the agent."
-    ),
-    "benign_risk": (
-        "The flagged behavior really exists but is low-risk, visible, and "
-        "consistent with the skill's stated purpose (e.g. running a local CLI, "
-        "starting a local server, reading its own files)."
-    ),
-    "false_positive": (
-        "The pattern matched but the code does not do what the rule claims "
-        "(e.g. no shell involved, value is not user-controlled, data never "
-        "leaves the machine), or it is documentation/comments only."
-    ),
-}
 
 
 def rule_id(issue: dict) -> str:
@@ -155,70 +135,18 @@ def build_state(issue: dict, skill_name: str, description: str, excerpt: str) ->
     return state[:MAX_STATE_CHARS]
 
 
-def ask_jev(api_key: str, model: str, state: str, retries: int = 3) -> dict:
-    payload = json.dumps(
-        {
-            "model": model,
-            "state": state,
-            "questions": {
-                "verdict": {
-                    "type": "choice",
-                    "instructions": "Classify this scanner finding.",
-                    "criteria": VERDICT_CRITERIA,
-                }
-            },
-        }
-    ).encode()
-    request = urllib.request.Request(
-        API_URL,
-        data=payload,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-    )
-    for attempt in range(retries):
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as exc:
-            if exc.code not in (429, 500, 502, 503, 504) or attempt == retries - 1:
-                raise RuntimeError(f"HTTP {exc.code}: {exc.read()[:300]!r}") from exc
-        except urllib.error.URLError as exc:
-            if attempt == retries - 1:
-                raise RuntimeError(str(exc)) from exc
-        time.sleep(2**attempt)
-    raise RuntimeError("unreachable")
+ACTIONS = {"keep": "keep", "remove": "drop", "downgrade": "downgrade"}
 
 
-def judge(issue, *, api_key, model, skill_dir, skill_name, description, drop_threshold, keep_threshold):
+def judge(issue, *, skill_dir, skill_name, description):
+    """Ask Jev and apply SkillGuard's shared validation and keep/remove/downgrade policy."""
     if is_coverage_finding(issue):
         return {"action": "keep", "verdict": "not_judged", "reason": "coverage finding (scanner limitation)"}
     file, start, end = location(issue)
     state = build_state(issue, skill_name, description, source_excerpt(skill_dir, file, start, end))
-    try:
-        response = ask_jev(api_key, model, state)
-    except RuntimeError as exc:
-        # Fail closed: an unjudged finding stays in the report.
-        return {"action": "keep", "verdict": "error", "reason": str(exc)}
-    answer = response["answers"]["verdict"]
-    probs = answer.get("probabilities", {})
-    p_fp = probs.get("false_positive", 0.0)
-    p_tp = probs.get("true_positive", 0.0)
-    severity = str(issue.get("severity", "")).upper()
-    if p_tp >= keep_threshold:
-        action = "keep"
-    elif p_fp >= drop_threshold:
-        action = "drop"
-    elif severity in SEVERITY_ORDER and SEVERITY_ORDER.index(severity) > SEVERITY_ORDER.index("LOW"):
-        # Unlikely to be a real threat but not clearly a false positive either.
-        action = "downgrade"
-    else:
-        action = "keep"
-    return {
-        "action": action,
-        "verdict": answer["choice"],
-        "probabilities": probs,
-        "confidence": answer.get("confidence"),
-        "cost": response.get("usage", {}).get("cost", 0.0),
-    }
+    result = triage.judge_state(state)  # invalid or failed answers come back as verdict "error"
+    action = ACTIONS[triage.decide(str(issue.get("severity", "")).upper(), result)]
+    return {**result, "action": action}
 
 
 def to_markdown(report: dict, results: list[tuple[dict, dict]], stats: dict) -> str:
@@ -272,15 +200,16 @@ def main() -> int:
     parser.add_argument("-o", "--output", type=Path, help="filtered JSON output")
     parser.add_argument("--md", type=Path, help="markdown summary output")
     parser.add_argument("--skill-dir", type=Path, help="skill source dir (default: skill.source in report)")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--drop-threshold", type=float, default=0.6, help="min P(false_positive) to remove")
-    parser.add_argument("--keep-threshold", type=float, default=0.2, help="P(true_positive) that always keeps")
+    parser.add_argument("--drop-threshold", type=float, default=triage.DROP_THRESHOLD, help="min P(false_positive) to remove")
+    parser.add_argument("--keep-threshold", type=float, default=triage.KEEP_THRESHOLD, help="P(true_positive) that always keeps")
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
+    triage.DROP_THRESHOLD, triage.KEEP_THRESHOLD = args.drop_threshold, args.keep_threshold
 
-    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("SKILLSPECTOR_COMPAT_API_KEY")
-    if not api_key:
-        sys.exit("Set OPENROUTER_API_KEY (or source skills/.env for SKILLSPECTOR_COMPAT_API_KEY).")
+    try:
+        openrouter.api_key()
+    except openrouter.LLMError as exc:
+        sys.exit(str(exc))
 
     report = json.loads(args.report.read_text())
     list_key, source, skill_name, issues, originals = load_report(report)
@@ -292,16 +221,7 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         verdicts = list(
             pool.map(
-                lambda issue: judge(
-                    issue,
-                    api_key=api_key,
-                    model=args.model,
-                    skill_dir=skill_dir,
-                    skill_name=skill_name,
-                    description=description,
-                    drop_threshold=args.drop_threshold,
-                    keep_threshold=args.keep_threshold,
-                ),
+                lambda issue: judge(issue, skill_dir=skill_dir, skill_name=skill_name, description=description),
                 issues,
             )
         )
@@ -320,7 +240,7 @@ def main() -> int:
 
     severities = [i.get("severity") for i in kept if i.get("severity") in SEVERITY_ORDER]
     stats = {
-        "model": args.model,
+        "model": "typesafe/jev-1.13",
         "total": len(issues),
         "seconds": time.monotonic() - started,
         "cost": sum(r.get("cost", 0.0) for _, r in results),

@@ -54,7 +54,7 @@ def to_markdown(result: dict) -> str:
     out = [
         f"# SkillGuard report: {skill['name']}",
         "",
-        f"## {VERDICT_ICON[result['verdict']]}",
+        f"## {VERDICT_ICON.get(result.get('verdict'), '❓ UNKNOWN VERDICT: ' + str(result.get('verdict')))}",
         "",
         f"**{result['reason']}**",
         "",
@@ -67,8 +67,8 @@ def to_markdown(result: dict) -> str:
     names = {"checks": "SkillGuard checks", "cisco": "Cisco scanner (code)", "triage": "Triage (Jev)",
              "semantic": "LLM review (instructions + code)"}
     for layer in result["layers"]:
-        out.append(f"| {names.get(layer['name'], layer['name'])} | {'✅ ran' if layer['ok'] else '❌ FAILED / incomplete'} | "
-                   f"{layer['detail']} ({layer['seconds']:.1f}s) |")
+        state = "⏭️ skipped" if layer.get("skipped") else ("✅ ran" if layer["ok"] else "❌ FAILED / incomplete")
+        out.append(f"| {names.get(layer['name'], layer['name'])} | {state} | {layer['detail']} ({layer['seconds']:.1f}s) |")
 
     if review:
         out += ["", "## Summary", "", review.get("summary", ""), "",

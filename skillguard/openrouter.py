@@ -9,7 +9,8 @@ import urllib.error
 import urllib.request
 
 BASE_URL = os.environ.get("SKILLGUARD_BASE_URL", "https://openrouter.ai/api/v1")
-RETRY_CODES = {408, 429, 500, 502, 503, 504}
+RETRY_CODES = {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}  # 52x: transient upstream/CDN errors
+COMPLETE_FINISH_REASONS = {"stop", "end_turn", "stop_sequence"}
 
 
 class LLMError(RuntimeError):
@@ -74,9 +75,13 @@ def chat_json(model: str, system: str, user: str, *, max_tokens: int = 8000) -> 
         content = choice["message"].get("content") or ""
     except (KeyError, IndexError, TypeError) as exc:
         raise LLMError(f"unexpected response: {str(body)[:300]}") from exc
+    finish = choice.get("finish_reason")
     if not content.strip():
         refusal = choice["message"].get("refusal")
-        raise LLMError(f"empty answer (finish_reason={choice.get('finish_reason')}, refusal={str(refusal)[:100]})")
+        raise LLMError(f"empty answer (finish_reason={finish}, refusal={str(refusal)[:100]})")
+    # A truncated or filtered answer may still parse as JSON but be incomplete; never accept it.
+    if finish not in COMPLETE_FINISH_REASONS:
+        raise LLMError(f"incomplete answer (finish_reason={finish})")
     # Tolerate code fences or prose around the object: decode the first complete JSON object.
     start = content.find("{")
     try:

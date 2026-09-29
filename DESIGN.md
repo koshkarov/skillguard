@@ -2,7 +2,7 @@
 
 A low-cost, pre-install security scanner for agent skills (Claude Code, Codex, Cursor and similar). It should catch most real security problems and explain each one clearly to the person deciding whether to install the skill.
 
-Status: v1 implemented and evaluated on 20 skills (see section 13). Last updated 2026-09-29.
+Status: v1.1: v1 plus fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-09-29.
 
 Usage:
 ```bash
@@ -10,7 +10,8 @@ export OPENROUTER_API_KEY=sk-or-...      # OpenRouter key
 python3 -m skillguard scan <skill-dir> --md report.md --json report.json [--sarif out.sarif]
 python3 -m skillguard eval --benign skills/skills --malicious <dir> --out skillguard-eval/run
 ```
-Exit codes: 0 SAFE, 1 REVIEW, 2 BLOCK. Flags: `--model`, `--no-llm`, `--no-triage`, `--no-cisco`.
+Exit codes: 0 SAFE, 1 REVIEW, 2 BLOCK, 3 error (nothing scannable, no verdict). Flags: `--model`, `--no-llm`, `--no-triage`, `--no-cisco`. A scan with `--no-llm` or `--no-cisco` is partial and can return BLOCK or REVIEW, never SAFE.
+Tests: `python3 -m unittest discover -s tests` (no network).
 
 ---
 
@@ -109,6 +110,9 @@ skill folder / zip / git URL
 | D14 | *(added)* **Large skills are split into several LLM calls, with SKILL.md in each; pure data files (`.xsd`, `.xml`, `.css`, `.svg`, `.csv`, JSON > 100 KB) are checked by Layer 1 only** | 4 of 19 real skills were too large for one call. The Office skills are mostly XML schemas, which are data, not instructions. The files skipped are listed in the report. | Raising the budget (cost), or dropping files (silent gaps). |
 | D15 | *(added)* **If the reviewer model's content filter refuses, re-review with a fallback model (GPT-6 Luna)** | Sonnet 5.5 via OpenRouter refused to review the malicious test skill (`finish_reason=content_filter`), because the request contains malicious code. The filter blocks exactly the skills that most need review. | Treating the refusal as a failure only (still safe through fail-closed, but it loses the explanation). |
 | D16 | *(added)* **Default reviewer model = GPT-6 Luna** | Same results as Sonnet on this test set at ~1/18 of the cost, and no content-filter refusals. | Sonnet 5.5 as the default. |
+| D17 | *(v1.1)* **Anything not inspected is a coverage gap → at least REVIEW**: symlinks (never followed), unknown binaries, bundled archives, text files > 2 MB, bundled `node_modules`/venv folders, missing `SKILL.md`. Known media (fonts, images, PDFs) are notes only. | The review found that such files were skipped while the scan reported success. A symlink could also pull files from outside the skill into the LLM prompt. | Silently skipping them (v1). |
+| D18 | *(v1.1)* **A partial scan never returns SAFE; a missing path is an error (exit 3), not a verdict** | `--no-llm --no-cisco` used to return SAFE with only the regex checks run, and a nonexistent path was SAFE too. | Qualified SAFE. |
+| D19 | *(v1.1)* **Validate every external output strictly**: Cisco (exit code, report shape, severities), Jev (choice, all three probabilities finite and summing to ~1), LLM (finish reason, all required fields, the full evidence quote at the cited line) | Malformed or truncated answers were accepted and could downgrade real findings or produce SAFE. | Best-effort parsing (v1). |
 
 ---
 
@@ -159,8 +163,8 @@ Derived from the OWASP checklist (numbers refer to `checklist.md` items).
 | Verdict | When |
 |---|---|
 | ⛔ BLOCK | Layer 2 intent = `malicious` **or** a Layer 1 HIGH/CRITICAL in AST01/03 confirmed independently of the LLM review (precise check, or Jev P(TP) ≥ 0.5). A Layer 2 finding on its own never blocks (D13). |
-| ⚠️ REVIEW | Any remaining HIGH, or Layer 2 intent = `suspicious`, **or any layer failed**, or coverage was incomplete |
-| ✅ SAFE | Everything else. LOW/INFO findings are still listed as notes. |
+| ⚠️ REVIEW | Any remaining HIGH, or Layer 2 intent = `suspicious`, **or any layer failed**, **or a coverage layer (checks, Cisco, LLM review) was skipped**, **or any coverage gap** (see D17) |
+| ✅ SAFE | Only for a complete scan with none of the above. LOW/INFO findings are still listed as notes. Skipping triage alone does not prevent SAFE, since triage only removes noise. |
 
 The thresholds are starting values, to be tuned on the test set (section 9).
 
@@ -261,6 +265,31 @@ Other observations:
 - The same issue can get a different severity between runs (soffice: MEDIUM in `docx`, LOW in `xlsx`). Borderline severities should not be relied on alone.
 - Jev triage lowered the Cisco CRITICAL false positive (`lsof` list arguments) correctly on every run.
 - Size: `claude-api` (1.4 MB) cost $0.06 with Luna and $1.32 with Sonnet. Luna costs $0.0003–0.06 per skill, typically ~$0.005.
+
+## 14. Code review fixes (v1.1)
+
+An external review found 14 bugs. All are fixed and covered by regression tests (`tests/test_skillguard.py`, 39 tests, no network):
+
+| # | Issue | Fix |
+|---|---|---|
+| 1 | Loader followed symlinks outside the skill, leaking files into the LLM prompt | `os.walk` without following links; symlinks and out-of-root files become coverage gaps |
+| 2 | Missing path or missing `SKILL.md` could be SAFE | Missing path → error, exit 3; missing manifest → coverage gap |
+| 3 | Oversized/binary files were skipped while the scan reported success | Coverage gaps (D17) |
+| 4 | Disabled layers disappeared and still allowed SAFE | Recorded as skipped; partial scans can't be SAFE (D18) |
+| 5 | Cisco adapter accepted failed or malformed reports | Exit code, shape and severity validation (D19) |
+| 6 | Jev answer without probabilities downgraded HIGH findings | `validate_answer`; invalid answers keep the severity and fail the layer |
+| 7 | Any ZIP + "password" on a line was a precise CRITICAL | Also requires download context (a URL or "download") |
+| 8 | Caps silently stopped checks (5/3/5 per file) and triage (80) | Caps removed; triage limit 1000 with overflow reported as a failure |
+| 9 | Upload rule missed `-T file`, `--upload-file`, `--json @file` | Rewritten: file-upload flags always count; data flags count when the payload is local |
+| 10 | Oversized SKILL.md bypassed the prompt budget | Files (SKILL.md included) are split into line-range parts; budget includes the system message |
+| 11 | Truncated but valid JSON answers were accepted | Finish reason must be a normal stop; all review fields validated |
+| 12 | Evidence checked only by its first 120 characters, anywhere in the file | Full quote within ±3 lines of the cited line |
+| 13 | Chunk merge could pair a malicious verdict with a benign behavior text | Behavior and summary come from the worst chunk |
+| 14 | Upload regex was quadratic on hostile long lines | Each command is examined once within a 600-character bound |
+
+Also: credential regex covers `.env.local`, `~/.aws` and `credentials.json`; base64 check requires entropy ≥ 4 bits/char; `tools/jev_filter.py` now uses the same Jev validation and decision code as SkillGuard; an unknown verdict renders instead of crashing; transient HTTP 52x errors are retried.
+
+Regression after the fixes (Luna): malicious 8/8 BLOCK; benign 0/19 BLOCK, 3/19 REVIEW. The REVIEWs: `web-artifacts-builder` ships a `.tar.gz` of source code that it extracts into the user's project and that nobody inspects (a correct new coverage gap; inspecting archives is a possible follow-up); `claude-api` hit a transient HTTP 520 in triage (now retried); `skill-creator`'s real script-injection issue was rated HIGH this run instead of MEDIUM (LLM variance).
 
 ## References
 

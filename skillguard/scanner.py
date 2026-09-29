@@ -28,22 +28,42 @@ def _confirmed(finding: Finding) -> bool:
 
 
 def verdict(findings: list[Finding], review: dict, layers: list[LayerStatus]) -> tuple[str, str]:
+    """BLOCK and REVIEW conditions first; SAFE only for a complete scan with nothing high left."""
     active = [f for f in findings if f.status != "removed"]
     high = [f for f in active if severity_rank(f.severity) >= severity_rank("HIGH")]
     blocking = [f for f in high if _confirmed(f) and f.ast in BLOCK_CATEGORIES]
+    gaps = [f for f in active if f.rule == "COVERAGE_GAP"]
     intent = review.get("intent")
-    failed = [layer.name for layer in layers if not layer.ok]
+    ran = {layer.name for layer in layers if not layer.skipped}
+    failed = [layer.name for layer in layers if not layer.skipped and not layer.ok]
+    missing = sorted(COVERAGE_LAYERS - ran)
     if intent == "malicious":
         return "BLOCK", "The instruction/code review judged this skill malicious."
     if blocking:
         return "BLOCK", f"{len(blocking)} confirmed high-severity finding(s): " + "; ".join(f.title for f in blocking[:3])
     if failed:
         return "REVIEW", f"Not every check completed ({', '.join(failed)}), so the skill cannot be cleared automatically."
+    if missing:
+        return "REVIEW", f"Partial scan: {', '.join(missing)} did not run, so the skill cannot be cleared automatically."
+    if gaps:
+        return "REVIEW", f"{len(gaps)} part(s) of the skill could not be inspected, so it cannot be cleared automatically."
     if intent == "suspicious":
         return "REVIEW", "The instruction/code review found suspicious behavior."
     if high:
         return "REVIEW", f"{len(high)} high-severity finding(s) need a human look: " + "; ".join(f.title for f in high[:3])
     return "SAFE", "No high-severity issues remained after all checks."
+
+
+# Layers without which the skill is not fully inspected. Triage only removes noise, so skipping it is safe.
+COVERAGE_LAYERS = {"checks", "cisco", "semantic"}
+
+
+def _guarded(name: str, fn, *args):
+    """Run a layer; an unexpected exception marks it failed instead of crashing or passing silently."""
+    try:
+        return fn(*args)
+    except Exception as exc:  # noqa: BLE001 - any failure must surface in the verdict
+        return None, LayerStatus(name, False, f"{name} crashed: {type(exc).__name__}: {str(exc)[:200]}")
 
 
 def _dedupe(findings: list[Finding]) -> list[Finding]:
@@ -64,31 +84,43 @@ def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_tr
     findings: list[Finding] = []
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        cisco_future = pool.submit(layer1.run_cisco, skill) if use_cisco else None
-        own, own_status = layer1.run_own_checks(skill)
-        findings.extend(own)
+        cisco_future = pool.submit(_guarded, "cisco", layer1.run_cisco, skill) if use_cisco else None
+        own, own_status = _guarded("checks", layer1.run_own_checks, skill)
+        findings.extend(own or [])
         layers.append(own_status)
         if cisco_future:
             cisco_findings, cisco_status = cisco_future.result()
-            findings.extend(cisco_findings)
+            findings.extend(cisco_findings or [])
             layers.append(cisco_status)
+        else:
+            layers.append(LayerStatus("cisco", True, "disabled (--no-cisco)", skipped=True))
     findings = _dedupe(findings)
 
     if use_triage:
-        layers.append(triage.run(skill, findings))
+        try:
+            layers.append(triage.run(skill, findings))
+        except Exception as exc:  # noqa: BLE001
+            layers.append(LayerStatus("triage", False, f"triage crashed: {type(exc).__name__}: {str(exc)[:200]}"))
+    else:
+        layers.append(LayerStatus("triage", True, "disabled (--no-triage)", skipped=True))
 
     review: dict = {}
     if use_llm:
         hints = [f for f in findings if f.status == "active"]
-        review, semantic_findings, semantic_status = semantic.run(skill, hints, model)
-        findings.extend(semantic_findings)
+        try:
+            review, semantic_findings, semantic_status = semantic.run(skill, hints, model)
+            findings.extend(semantic_findings)
+        except Exception as exc:  # noqa: BLE001
+            semantic_status = LayerStatus("semantic", False, f"LLM review crashed: {type(exc).__name__}: {str(exc)[:200]}")
         layers.append(semantic_status)
+    else:
+        layers.append(LayerStatus("semantic", True, "disabled (--no-llm)", skipped=True))
 
     findings.sort(key=lambda f: (f.status != "active", -severity_rank(f.severity), f.ast, f.location))
     label, reason = verdict(findings, review, layers)
     return {
         "skill": {"name": skill.name, "path": str(skill.root), "description": skill.description,
-                  "files": len(skill.files) + len(skill.binary_files)},
+                  "files": len(skill.files) + len(skill.binary_files), "coverage_gaps": skill.coverage_gaps},
         "verdict": label,
         "reason": reason,
         "review": review,
