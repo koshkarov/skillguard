@@ -77,8 +77,10 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
 
 
 def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_triage: bool = True,
-         use_cisco: bool = True) -> dict:
+         use_cisco: bool = True, triage_model: str | None = None) -> dict:
+    """Scan one skill. `triage_model` defaults to `model`, so a single OpenRouter model is enough."""
     started = time.monotonic()
+    triage_model = triage_model or model
     skill = load_skill(path)
     layers: list[LayerStatus] = []
     findings: list[Finding] = []
@@ -98,7 +100,7 @@ def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_tr
 
     if use_triage:
         try:
-            layers.append(triage.run(skill, findings))
+            layers.append(triage.run(skill, findings, model=triage_model))
         except Exception as exc:  # noqa: BLE001
             layers.append(LayerStatus("triage", False, f"triage crashed: {type(exc).__name__}: {str(exc)[:200]}"))
     else:
@@ -127,6 +129,8 @@ def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_tr
         "findings": [f.to_dict() for f in findings],
         "layers": [vars(layer) for layer in layers],
         "cost": round(sum(layer.cost for layer in layers), 6),
+        "tokens_in": sum(layer.tokens_in for layer in layers),
+        "tokens_out": sum(layer.tokens_out for layer in layers),
         "seconds": round(time.monotonic() - started, 2),
         "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     }

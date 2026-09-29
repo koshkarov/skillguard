@@ -134,6 +134,15 @@ class VerdictTests(unittest.TestCase):
         result = scanner.scan(make_skill({"SKILL.md": MANIFEST}), use_llm=False, use_triage=False, use_cisco=False)
         self.assertEqual(result["verdict"], "REVIEW")
         self.assertEqual({l["name"] for l in result["layers"] if l["skipped"]}, {"cisco", "triage", "semantic"})
+        self.assertEqual((result["tokens_in"], result["tokens_out"]), (0, 0))
+
+    def test_scan_totals_tokens_across_layers(self):
+        review = {"intent": "benign", "declared_purpose": "p", "actual_behavior": "b", "summary": "s", "findings": []}
+        status = LayerStatus("semantic", True, "d", tokens_in=1234, tokens_out=56)
+        with mock.patch.object(semantic, "run", return_value=(review, [], status)):
+            result = scanner.scan(make_skill({"SKILL.md": MANIFEST}), use_triage=False, use_cisco=False)
+        self.assertEqual((result["tokens_in"], result["tokens_out"]), (1234, 56))
+        self.assertIn("1,234 in / 56 out tokens", report.to_markdown(result))
 
 
 # --- Cisco adapter (bug 5) --------------------------------------------------------------------------
@@ -183,6 +192,51 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(triage.decide("HIGH", probs(0.0, 0.3, 0.7)), "remove")
         self.assertEqual(triage.decide("HIGH", probs(0.0, 0.6, 0.4)), "downgrade")
         self.assertEqual(triage.decide("INFO", probs(0.0, 0.6, 0.4)), "keep")
+
+    def _llm_setup(self, n=3):
+        skill = load_skill(make_skill({"SKILL.md": MANIFEST}))
+        findings = [Finding("cisco", f"R{i}", "AST01", "HIGH", "x", file="SKILL.md", line=1) for i in range(n)]
+        return skill, findings
+
+    @staticmethod
+    def _judgment(fid, verdict, tp, br, fp):
+        return {"id": fid, "verdict": verdict, "reason": "r",
+                "probabilities": {"true_positive": tp, "benign_risk": br, "false_positive": fp}}
+
+    def test_chat_model_triage_applies_same_policy_and_counts_tokens(self):
+        skill, findings = self._llm_setup()
+        answer = {"judgments": [self._judgment("F1", "true_positive", 0.9, 0.1, 0.0),
+                                self._judgment("F2", "false_positive", 0.0, 0.2, 0.8),
+                                self._judgment("F3", "benign_risk", 0.05, 0.75, 0.2)]}
+        usage = {"prompt_tokens": 1000, "completion_tokens": 200, "cost": 0.0002}
+        with mock.patch.object(triage, "chat_json", return_value=(answer, usage)):
+            status = triage.run(skill, findings, model="openai/gpt-6-luna")
+        self.assertTrue(status.ok)
+        self.assertEqual([f.status for f in findings], ["active", "removed", "downgraded"])
+        self.assertEqual((status.tokens_in, status.tokens_out), (1000, 200))
+
+    def test_chat_model_missing_judgment_keeps_finding_and_fails_layer(self):
+        skill, findings = self._llm_setup(2)
+        answer = {"judgments": [self._judgment("F1", "false_positive", 0.0, 0.1, 0.9)]}  # F2 missing
+        with mock.patch.object(triage, "chat_json", return_value=(answer, {"prompt_tokens": 10, "completion_tokens": 5})):
+            status = triage.run(skill, findings, model="openai/gpt-6-luna")
+        self.assertFalse(status.ok)
+        self.assertEqual(findings[1].status, "active")
+        self.assertEqual(findings[1].severity, "HIGH")
+        self.assertEqual(status.tokens_in, 20)  # both attempts are counted
+
+    def test_chat_model_error_counts_tokens(self):
+        skill, findings = self._llm_setup(1)
+        err = openrouter.LLMError("incomplete answer", {"prompt_tokens": 7, "completion_tokens": 3})
+        with mock.patch.object(triage, "chat_json", side_effect=err):
+            status = triage.run(skill, findings, model="openai/gpt-6-luna")
+        self.assertFalse(status.ok)
+        self.assertEqual((status.tokens_in, status.tokens_out), (14, 6))
+
+    def test_batches_respect_size(self):
+        batches = triage._llm_batches([(f"F{i}", "x" * 10) for i in range(40)])
+        self.assertTrue(all(len(b) <= triage.LLM_BATCH_FINDINGS for b in batches))
+        self.assertEqual(sum(len(b) for b in batches), 40)
 
     def test_limit_overflow_fails_layer(self):
         findings = [Finding("cisco", f"R{i}", "AST01", "HIGH", "x", file="SKILL.md", line=1) for i in range(5)]

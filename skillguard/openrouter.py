@@ -14,7 +14,35 @@ COMPLETE_FINISH_REASONS = {"stop", "end_turn", "stop_sequence"}
 
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(self, message: str, usage: dict | None = None):
+        super().__init__(message)
+        self.usage = usage or {}  # tokens are billed even when the answer is unusable
+
+
+# $ per million tokens (input, output), for cost reporting when the provider omits cost.
+PRICES = {
+    "openai/gpt-6-luna": (0.10, 0.50),
+    "openai/gpt-6-luna-pro": (0.10, 0.50),
+    "anthropic/claude-sonnet-5.5": (2.0, 10.0),
+    "anthropic/claude-sonnet-5": (2.0, 10.0),
+}
+
+
+def cost_of(model: str, usage: dict) -> float:
+    """Provider-reported cost when present, else estimated from the token counts."""
+    if usage.get("cost") is not None:
+        return float(usage["cost"])
+    price_in, price_out = PRICES.get(model, (0.0, 0.0))
+    return usage.get("prompt_tokens", 0) * price_in / 1e6 + usage.get("completion_tokens", 0) * price_out / 1e6
+
+
+def add_usage(total: dict, usage: dict) -> dict:
+    """Accumulate OpenRouter chat usage (prompt/completion tokens, cost) into `total`."""
+    for key in ("prompt_tokens", "completion_tokens"):
+        total[key] = total.get(key, 0) + int(usage.get(key) or 0)
+    if usage.get("cost") is not None:
+        total["cost"] = total.get("cost", 0.0) + float(usage["cost"])
+    return total
 
 
 def api_key() -> str:
@@ -70,28 +98,29 @@ def chat_json(model: str, system: str, user: str, *, max_tokens: int = 8000) -> 
             "usage": {"include": True},
         },
     )
+    usage = (body.get("usage") or {}) if isinstance(body, dict) else {}
     try:
         choice = body["choices"][0]
         content = choice["message"].get("content") or ""
     except (KeyError, IndexError, TypeError) as exc:
-        raise LLMError(f"unexpected response: {str(body)[:300]}") from exc
+        raise LLMError(f"unexpected response: {str(body)[:300]}", usage) from exc
     finish = choice.get("finish_reason")
     if not content.strip():
         refusal = choice["message"].get("refusal")
-        raise LLMError(f"empty answer (finish_reason={finish}, refusal={str(refusal)[:100]})")
+        raise LLMError(f"empty answer (finish_reason={finish}, refusal={str(refusal)[:100]})", usage)
     # A truncated or filtered answer may still parse as JSON but be incomplete; never accept it.
     if finish not in COMPLETE_FINISH_REASONS:
-        raise LLMError(f"incomplete answer (finish_reason={finish})")
+        raise LLMError(f"incomplete answer (finish_reason={finish})", usage)
     # Tolerate code fences or prose around the object: decode the first complete JSON object.
     start = content.find("{")
     try:
         data, _ = json.JSONDecoder().raw_decode(content[start:]) if start >= 0 else (None, 0)
     except json.JSONDecodeError as exc:
         raise LLMError(f"model returned invalid JSON ({exc.msg} at {exc.pos}, finish_reason="
-                       f"{choice.get('finish_reason')}): {content[:120]!r}") from exc
+                       f"{choice.get('finish_reason')}): {content[:120]!r}", usage) from exc
     if not isinstance(data, dict):
-        raise LLMError(f"model did not return a JSON object: {content[:120]!r}")
-    return data, body.get("usage", {})
+        raise LLMError(f"model did not return a JSON object: {content[:120]!r}", usage)
+    return data, usage
 
 
 def jev(state: str, questions: dict, *, model: str = "typesafe/jev-1.13") -> dict:

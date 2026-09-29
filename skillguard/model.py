@@ -66,3 +66,5 @@ class LayerStatus:
     seconds: float = 0.0
     cost: float = 0.0
     skipped: bool = False   # disabled by the user; counts as "did not run" for the verdict
+    tokens_in: int = 0      # all LLM calls of this layer, including retries and failed calls
+    tokens_out: int = 0

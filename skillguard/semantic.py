@@ -8,19 +8,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from .model import AST_NAMES, SEVERITIES, Finding, LayerStatus
-from .openrouter import LLMError, chat_json
+from .openrouter import LLMError, add_usage, chat_json, cost_of
 from .skill import Skill, is_license, numbered
 
 MAX_PROMPT_CHARS = 400_000  # ~100K tokens
 INTENTS = ["benign", "risky_but_legitimate", "suspicious", "malicious"]
-
-# $ per million tokens (input, output), for cost reporting when the provider omits cost.
-PRICES = {
-    "openai/gpt-6-luna": (0.10, 0.50),
-    "openai/gpt-6-luna-pro": (0.10, 0.50),
-    "anthropic/claude-sonnet-5.5": (2.0, 10.0),
-    "anthropic/claude-sonnet-5": (2.0, 10.0),
-}
 
 SYSTEM = """You are a security reviewer for AI agent skills (packages of instructions and scripts that an AI \
 agent loads and follows). Decide whether installing this skill is safe, and explain it to a non-expert.
@@ -222,23 +214,19 @@ def validate_review(data: dict) -> str:
 
 
 def _review_chunk(model: str, system: str, prompt: str) -> tuple[dict | None, dict, str]:
-    error = ""
+    """Returns (review or None, usage summed over all attempts, error)."""
+    error, total = "", {}
     for _ in range(2):  # one retry on invalid output
         try:
             data, usage = chat_json(model, system, prompt)
+            add_usage(total, usage)
             error = validate_review(data)
             if not error:
-                return data, usage, ""
+                return data, total, ""
         except LLMError as exc:
+            add_usage(total, exc.usage)
             error = str(exc)[:300]
-    return None, {}, error
-
-
-def _cost(model: str, usage: dict) -> float:
-    if usage.get("cost") is not None:
-        return float(usage["cost"])
-    price_in, price_out = PRICES.get(model, (0.0, 0.0))
-    return usage.get("prompt_tokens", 0) * price_in / 1e6 + usage.get("completion_tokens", 0) * price_out / 1e6
+    return None, total, error
 
 
 def merge_reviews(reviews: list[dict]) -> dict:
@@ -265,7 +253,7 @@ def run(skill: Skill, hints: list[Finding], model: str) -> tuple[dict, list[Find
     prompts, data_files = build_prompts(skill, hints, nonce, system_chars=len(system))
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda p: _review_chunk(model, system, p), prompts))
-    cost = sum(_cost(model, usage) for _, usage, _ in results)
+    spent = [(model, usage) for _, usage, _ in results]  # every call made, for tokens and cost
     # A provider content filter can refuse exactly the most malicious skills. Re-review those chunks with a
     # fallback model instead of losing the instruction-layer review.
     blocked = [i for i, (data, _, error) in enumerate(results) if data is None and "content_filter" in error]
@@ -273,21 +261,23 @@ def run(skill: Skill, hints: list[Finding], model: str) -> tuple[dict, list[Find
     if used_fallback:
         for i in blocked:
             results[i] = _review_chunk(FALLBACK_MODEL, system, prompts[i])
-            cost += _cost(FALLBACK_MODEL, results[i][1])
+            spent.append((FALLBACK_MODEL, results[i][1]))
     seconds = time.monotonic() - started
-    tokens_in = sum(usage.get("prompt_tokens", 0) for _, usage, _ in results)
-    tokens_out = sum(usage.get("completion_tokens", 0) for _, usage, _ in results)
+    cost = sum(cost_of(m, usage) for m, usage in spent)
+    tokens_in = sum(usage.get("prompt_tokens", 0) for _, usage in spent)
+    tokens_out = sum(usage.get("completion_tokens", 0) for _, usage in spent)
     errors = [error for data, _, error in results if data is None]
     reviews = [data for data, _, _ in results if data is not None]
     if not reviews:
-        return {}, [], LayerStatus("semantic", False, f"LLM review failed: {errors[0]}", seconds, cost)
+        return {}, [], LayerStatus("semantic", False, f"LLM review failed: {errors[0]}", seconds, cost,
+                                   tokens_in=tokens_in, tokens_out=tokens_out)
     review = merge_reviews(reviews)
-    detail = f"{model}, {len(prompts)} call(s), {tokens_in} in / {tokens_out} out tokens"
+    detail = f"{model}, {len(prompts)} call(s)"
     if used_fallback:
         detail += f"; {len(blocked)} call(s) refused by {model}'s content filter, reviewed with {FALLBACK_MODEL}"
     if data_files:
         detail += f"; {len(data_files)} data file(s) checked by static layer only"
     if errors:
         detail += f"; {len(errors)} of {len(prompts)} call(s) failed: {errors[0]}"
-    status = LayerStatus("semantic", not errors, detail, seconds, cost)
+    status = LayerStatus("semantic", not errors, detail, seconds, cost, tokens_in=tokens_in, tokens_out=tokens_out)
     return review, _to_findings(skill, review), status

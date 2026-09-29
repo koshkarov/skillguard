@@ -59,16 +59,18 @@ def to_markdown(result: dict) -> str:
         f"**{result['reason']}**",
         "",
         f"`{skill['path']}` · {skill['files']} files · scanned {result['scanned_at']} · "
-        f"{result['seconds']}s · ${result['cost']:.4f}",
+        f"{result['seconds']}s · ${result['cost']:.4f} · "
+        f"{result.get('tokens_in', 0):,} in / {result.get('tokens_out', 0):,} out tokens",
         "",
-        "| Check | Status | Details |",
-        "|---|---|---|",
+        "| Check | Status | Details | Tokens in | Tokens out | Cost |",
+        "|---|---|---|---:|---:|---:|",
     ]
-    names = {"checks": "SkillGuard checks", "cisco": "Cisco scanner (code)", "triage": "Triage (Jev)",
+    names = {"checks": "SkillGuard checks", "cisco": "Cisco scanner (code)", "triage": "Triage",
              "semantic": "LLM review (instructions + code)"}
     for layer in result["layers"]:
         state = "⏭️ skipped" if layer.get("skipped") else ("✅ ran" if layer["ok"] else "❌ FAILED / incomplete")
-        out.append(f"| {names.get(layer['name'], layer['name'])} | {state} | {layer['detail']} ({layer['seconds']:.1f}s) |")
+        out.append(f"| {names.get(layer['name'], layer['name'])} | {state} | {layer['detail']} ({layer['seconds']:.1f}s) | "
+                   f"{layer.get('tokens_in', 0):,} | {layer.get('tokens_out', 0):,} | ${layer.get('cost', 0):.4f} |")
 
     if review:
         out += ["", "## Summary", "", review.get("summary", ""), "",

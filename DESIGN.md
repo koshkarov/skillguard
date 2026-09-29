@@ -2,7 +2,7 @@
 
 A low-cost, pre-install security scanner for agent skills (Claude Code, Codex, Cursor and similar). It should catch most real security problems and explain each one clearly to the person deciding whether to install the skill.
 
-Status: v1.1: v1 plus fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-09-29.
+Status: v1.2: v1.1 plus token accounting and single-model operation (D20); v1.1 = v1 plus fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-09-29.
 
 Usage:
 ```bash
@@ -112,6 +112,7 @@ skill folder / zip / git URL
 | D16 | *(added)* **Default reviewer model = GPT-6 Luna** | Same results as Sonnet on this test set at ~1/18 of the cost, and no content-filter refusals. | Sonnet 5.5 as the default. |
 | D17 | *(v1.1)* **Anything not inspected is a coverage gap → at least REVIEW**: symlinks (never followed), unknown binaries, bundled archives, text files > 2 MB, bundled `node_modules`/venv folders, missing `SKILL.md`. Known media (fonts, images, PDFs) are notes only. | The review found that such files were skipped while the scan reported success. A symlink could also pull files from outside the skill into the LLM prompt. | Silently skipping them (v1). |
 | D18 | *(v1.1)* **A partial scan never returns SAFE; a missing path is an error (exit 3), not a verdict** | `--no-llm --no-cisco` used to return SAFE with only the regex checks run, and a nonexistent path was SAFE too. | Qualified SAFE. |
+| D20 | *(v1.2)* **Triage uses the review model by default; Jev is optional** (`--triage-model`) | Jev is not available to everyone. A chat model gets the same question and answer shape (verdict + three probabilities), batched per skill, and goes through the same validation and decision code. On 54 static findings judged by both, Luna and Jev took the same action on 48; all 6 differences were "remove" vs "downgrade", never keep vs discard. Detection results were identical (8/8 BLOCK, 0/19 benign BLOCK). Triage cost for 27 skills: Luna $0.010, Jev $0.0035. | Jev only (v1); a separate cheap model per layer. |
 | D19 | *(v1.1)* **Validate every external output strictly**: Cisco (exit code, report shape, severities), Jev (choice, all three probabilities finite and summing to ~1), LLM (finish reason, all required fields, the full evidence quote at the cited line) | Malformed or truncated answers were accepted and could downgrade real findings or produce SAFE. | Best-effort parsing (v1). |
 
 ---

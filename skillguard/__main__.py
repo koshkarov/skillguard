@@ -17,6 +17,7 @@ from pathlib import Path
 from . import report
 from .scanner import DEFAULT_MODEL, scan
 from .skill import SkillLoadError
+from .triage import DEFAULT_MODEL as JEV_MODEL
 
 EXIT = {"SAFE": 0, "REVIEW": 1, "BLOCK": 2}
 EXIT_ERROR = 3  # nothing could be scanned; no verdict issued
@@ -24,7 +25,11 @@ EXIT_ERROR = 3  # nothing could be scanned; no verdict issued
 
 def _scan_args(args) -> dict:
     return {"model": args.model, "use_llm": not args.no_llm, "use_triage": not args.no_triage,
-            "use_cisco": not args.no_cisco}
+            "use_cisco": not args.no_cisco, "triage_model": args.triage_model}
+
+
+def _tokens(tokens_in: int, tokens_out: int) -> str:
+    return f"{tokens_in:,} in / {tokens_out:,} out tokens"
 
 
 def cmd_scan(args) -> int:
@@ -43,7 +48,8 @@ def cmd_scan(args) -> int:
     if not (args.md or args.json or args.sarif):
         print(markdown)
     else:
-        print(f"{result['verdict']}: {result['reason']}  (${result['cost']:.4f}, {result['seconds']}s)")
+        print(f"{result['verdict']}: {result['reason']}  "
+              f"(${result['cost']:.4f}, {_tokens(result['tokens_in'], result['tokens_out'])}, {result['seconds']}s)")
     return EXIT[result["verdict"]]
 
 
@@ -69,7 +75,8 @@ def cmd_eval(args) -> int:
         try:
             result = scan(path, **_scan_args(args))
         except Exception as exc:  # keep evaluating the rest
-            return path, label, {"verdict": "ERROR", "reason": str(exc), "cost": 0, "seconds": 0, "layers": [], "findings": []}
+            return path, label, {"verdict": "ERROR", "reason": str(exc), "cost": 0, "seconds": 0, "layers": [],
+                                 "findings": [], "tokens_in": 0, "tokens_out": 0}
         stem = "__".join(part.strip(".") for part in path.parts[-3:])
         (out / f"{stem}.md").write_text(report.to_markdown(result))
         (out / f"{stem}.json").write_text(json.dumps(result, indent=2))
@@ -78,25 +85,31 @@ def cmd_eval(args) -> int:
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         rows = list(pool.map(run, cases))
 
-    lines = ["| Skill | Label | Verdict | Active findings | Failed layers | Cost | Time |", "|---|---|---|---|---|---|---|"]
+    lines = ["| Skill | Label | Verdict | Active findings | Failed layers | Tokens in | Tokens out | Cost | Time |",
+             "|---|---|---|---|---|---:|---:|---:|---:|"]
     for path, label, r in rows:
         ok = label == "unlabeled" or ((r["verdict"] in ("BLOCK", "REVIEW")) if label == "malicious" else (r["verdict"] != "BLOCK"))
-        failed = ", ".join(l["name"] for l in r["layers"] if not l["ok"]) or "—"
+        failed = ", ".join(l["name"] for l in r["layers"] if not l["ok"] and not l.get("skipped")) or "—"
         active = sum(f["status"] == "active" for f in r["findings"])
         name = "/".join(path.parts[-3:])
         lines.append(f"| {'' if ok else '❌ '}{name} | {label} | {r['verdict']} | {active} | {failed} | "
-                     f"${r['cost']:.4f} | {r['seconds']}s |")
+                     f"{r['tokens_in']:,} | {r['tokens_out']:,} | ${r['cost']:.4f} | {r['seconds']}s |")
+    total_in, total_out = sum(r["tokens_in"] for _, _, r in rows), sum(r["tokens_out"] for _, _, r in rows)
+    total_cost = sum(r["cost"] for _, _, r in rows)
+    lines.append(f"| **Total ({len(rows)} skills)** | | | | | **{total_in:,}** | **{total_out:,}** | **${total_cost:.4f}** | |")
     benign = [r for _, l, r in rows if l == "benign"]
     malicious = [r for _, l, r in rows if l == "malicious"]
     def share(items, verdicts):
         return f"{sum(r['verdict'] in verdicts for r in items)}/{len(items)}" if items else "n/a"
     summary = [
-        "", f"Model: `{args.model}` · LLM: {not args.no_llm} · triage: {not args.no_triage} · Cisco: {not args.no_cisco}",
+        "", f"Review model: `{args.model}` · triage model: `{args.triage_model or args.model}` · LLM: {not args.no_llm} · "
+            f"triage: {not args.no_triage} · Cisco: {not args.no_cisco}",
         "",
         f"- Malicious caught (BLOCK or REVIEW): **{share(malicious, {'BLOCK', 'REVIEW'})}**, BLOCK: {share(malicious, {'BLOCK'})}",
         f"- Benign false BLOCK: **{share(benign, {'BLOCK'})}**, REVIEW: {share(benign, {'REVIEW'})}, SAFE: {share(benign, {'SAFE'})}",
-        f"- Scans with a failed layer: {sum(any(not l['ok'] for l in r['layers']) for _, _, r in rows)}/{len(rows)}",
-        f"- Total cost: ${sum(r['cost'] for _, _, r in rows):.4f} · mean time {sum(r['seconds'] for _, _, r in rows) / max(1, len(rows)):.1f}s",
+        f"- Scans with a failed layer: {sum(any(not l['ok'] and not l.get('skipped') for l in r['layers']) for _, _, r in rows)}/{len(rows)}",
+        f"- Total: {_tokens(total_in, total_out)} · ${total_cost:.4f} · mean time "
+        f"{sum(r['seconds'] for _, _, r in rows) / max(1, len(rows)):.1f}s per skill",
     ]
     text = "\n".join(lines + summary) + "\n"
     (out / "SUMMARY.md").write_text(text)
@@ -111,7 +124,10 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenRouter model for the LLM review (default {DEFAULT_MODEL})")
         p.add_argument("--no-llm", action="store_true", help="skip the LLM instruction/code review")
-        p.add_argument("--no-triage", action="store_true", help="skip Jev triage of static findings")
+        p.add_argument("--triage-model", default=None,
+                       help="model that triages static findings (default: same as --model, so one model is enough); "
+                            f"use {JEV_MODEL} for TypeSafe Jev")
+        p.add_argument("--no-triage", action="store_true", help="skip triage of static findings")
         p.add_argument("--no-cisco", action="store_true", help="skip the Cisco scanner")
         if name == "scan":
             p.add_argument("path")
