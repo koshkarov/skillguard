@@ -7,11 +7,11 @@ import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from . import config
+from .llm import LLMError, add_usage, chat_json, cost_of
 from .model import AST_NAMES, SEVERITIES, Finding, LayerStatus
-from .openrouter import LLMError, add_usage, chat_json, cost_of
 from .skill import Skill, is_license, numbered
 
-MAX_PROMPT_CHARS = 400_000  # ~100K tokens
 INTENTS = ["benign", "risky_but_legitimate", "suspicious", "malicious"]
 
 SYSTEM = """You are a security reviewer for AI agent skills (packages of instructions and scripts that an AI \
@@ -126,7 +126,7 @@ def build_prompts(skill: Skill, hints: list[Finding], nonce: str, system_chars: 
     manifest = skill.manifest
     manifest_parts = _parts(manifest, nonce, MANIFEST_CONTEXT_CHARS) if manifest else []
     base = header + (manifest_parts[0] if manifest_parts else "")
-    capacity = MAX_PROMPT_CHARS - system_chars - len(base)
+    capacity = config.settings.max_prompt_chars - system_chars - len(base)
     if capacity < 10_000:
         raise ValueError("prompt budget too small for the skill manifest context")
     blocks: list[str] = manifest_parts[1:]
@@ -218,7 +218,7 @@ def _review_chunk(model: str, system: str, prompt: str) -> tuple[dict | None, di
     error, total = "", {}
     for _ in range(2):  # one retry on invalid output
         try:
-            data, usage = chat_json(model, system, prompt)
+            data, usage = chat_json(model, system, prompt, max_tokens=config.settings.review_max_tokens)
             add_usage(total, usage)
             error = validate_review(data)
             if not error:
@@ -243,11 +243,9 @@ def merge_reviews(reviews: list[dict]) -> dict:
     }
 
 
-FALLBACK_MODEL = "openai/gpt-6-luna"
-
-
 def run(skill: Skill, hints: list[Finding], model: str) -> tuple[dict, list[Finding], LayerStatus]:
     started = time.monotonic()
+    fallback = config.settings.effective_fallback_model
     nonce = secrets.token_hex(6)
     system = SYSTEM.format(nonce=nonce)
     prompts, data_files = build_prompts(skill, hints, nonce, system_chars=len(system))
@@ -257,11 +255,11 @@ def run(skill: Skill, hints: list[Finding], model: str) -> tuple[dict, list[Find
     # A provider content filter can refuse exactly the most malicious skills. Re-review those chunks with a
     # fallback model instead of losing the instruction-layer review.
     blocked = [i for i, (data, _, error) in enumerate(results) if data is None and "content_filter" in error]
-    used_fallback = bool(blocked) and model != FALLBACK_MODEL
+    used_fallback = bool(blocked and fallback) and model != fallback
     if used_fallback:
         for i in blocked:
-            results[i] = _review_chunk(FALLBACK_MODEL, system, prompts[i])
-            spent.append((FALLBACK_MODEL, results[i][1]))
+            results[i] = _review_chunk(fallback, system, prompts[i])
+            spent.append((fallback, results[i][1]))
     seconds = time.monotonic() - started
     cost = sum(cost_of(m, usage) for m, usage in spent)
     tokens_in = sum(usage.get("prompt_tokens", 0) for _, usage in spent)
@@ -274,7 +272,7 @@ def run(skill: Skill, hints: list[Finding], model: str) -> tuple[dict, list[Find
     review = merge_reviews(reviews)
     detail = f"{model}, {len(prompts)} call(s)"
     if used_fallback:
-        detail += f"; {len(blocked)} call(s) refused by {model}'s content filter, reviewed with {FALLBACK_MODEL}"
+        detail += f"; {len(blocked)} call(s) refused by {model}'s content filter, reviewed with {fallback}"
     if data_files:
         detail += f"; {len(data_files)} data file(s) checked by static layer only"
     if errors:

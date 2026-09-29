@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import config
+
 TEXT_SUFFIXES = {
     ".md", ".txt", ".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".tsx",
     ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini", ".html", ".htm", ".css", ".ps1",
@@ -21,7 +23,6 @@ MEDIA_SUFFIXES = {
 IGNORED_DIRS = {".git"}  # VCS metadata; never loaded by an agent
 UNSCANNED_DIRS = {"node_modules", "__pycache__", ".venv", "venv"}  # skipped, but reported as a coverage gap
 LICENSE_NAMES = {"license", "license.txt", "license.md", "copying", "notice"}
-MAX_FILE_BYTES = 2_000_000
 
 
 class SkillLoadError(ValueError):
@@ -119,11 +120,11 @@ def load_skill(root: Path) -> Skill:
     for path in _walk(root, gaps):
         rel = path.relative_to(root).as_posix()
         suffix = path.suffix.lower()
-        if path.stat().st_size > MAX_FILE_BYTES:
+        if path.stat().st_size > config.settings.max_file_bytes:
             if suffix in MEDIA_SUFFIXES:
                 media.append(rel)
             else:
-                gaps.append(f"{rel}: larger than {MAX_FILE_BYTES // 1_000_000} MB, not inspected")
+                gaps.append(f"{rel}: larger than {config.settings.max_file_bytes:,} bytes, not inspected")
             continue
         raw = path.read_bytes()
         text = None

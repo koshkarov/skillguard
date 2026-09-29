@@ -19,13 +19,59 @@ If any layer fails, the verdict becomes at least REVIEW, never a silent SAFE. Se
 
 - Python 3.10+
 - [`uv`](https://docs.astral.sh/uv/). The Cisco scanner is run with `uvx`, so there's no separate install.
-- An [OpenRouter](https://openrouter.ai) API key for layers 2 and 3
+- For layers 2 and 3, one of:
+  - an [OpenRouter](https://openrouter.ai) API key (default backend, no extra packages), or
+  - [LiteLLM](https://docs.litellm.ai/) (`pip install litellm`) for any other provider: Anthropic, OpenAI, Bedrock, Vertex, Azure, local Ollama, a LiteLLM proxy, …
+
+## Configuration
+
+Every setting is a `SKILLGUARD_*` environment variable. You can also put them in a `.env` file, which is read from the current directory, or from `SKILLGUARD_ENV_FILE`/`--env-file`. CLI flags override the environment, which overrides the file. [`.env.example`](.env.example) lists all of them.
+
+```bash
+cp .env.example .env          # then edit
+python3 -m skillguard config  # show the effective settings (keys masked)
+```
+
+The main ones:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SKILLGUARD_API_KEY` | — | API key (required for the OpenRouter backend) |
+| `SKILLGUARD_BACKEND` | `openrouter` | `openrouter` or `litellm` |
+| `SKILLGUARD_MODEL` | `openai/gpt-6-luna` | review model |
+| `SKILLGUARD_TRIAGE_MODEL` | same as model | triage model; `typesafe/jev-1.13` for Jev |
+| `SKILLGUARD_BASE_URL` | OpenRouter | any OpenAI-compatible endpoint, or LiteLLM `api_base` |
+| `SKILLGUARD_LLM` / `_TRIAGE` / `_CISCO` | `true` | turn layers on or off |
+
+Examples:
+
+```bash
+# OpenRouter (default)
+SKILLGUARD_API_KEY=sk-or-...
+
+# Anthropic directly, through LiteLLM (LiteLLM reads ANTHROPIC_API_KEY itself)
+SKILLGUARD_BACKEND=litellm
+SKILLGUARD_MODEL=anthropic/claude-sonnet-5.5
+SKILLGUARD_FALLBACK_MODEL=none      # or another model when Anthropic's filter refuses a malicious skill
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Local model through Ollama (no data leaves the machine)
+SKILLGUARD_BACKEND=litellm
+SKILLGUARD_MODEL=ollama/llama3.1
+SKILLGUARD_BASE_URL=http://localhost:11434
+SKILLGUARD_FALLBACK_MODEL=none
+
+# A LiteLLM proxy server (OpenAI-compatible), no litellm package needed
+SKILLGUARD_BASE_URL=http://localhost:4000
+SKILLGUARD_API_KEY=sk-litellm-...
+SKILLGUARD_MODEL=my-proxy-model-alias
+```
+
+Without installing `litellm`, run the LiteLLM backend with `uv run --no-project --with litellm python3 -m skillguard ...`.
 
 ## Usage
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...
-
 # Scan one skill
 python3 -m skillguard scan path/to/skill --md report.md --json report.json --sarif report.sarif
 
@@ -41,9 +87,11 @@ python3 -m unittest discover -s tests
 
 Exit codes: `0` SAFE, `1` REVIEW, `2` BLOCK, `3` error (path not scannable, no verdict), so the scanner can gate CI.
 
-Options: `--model` (any OpenRouter model; default `openai/gpt-6-luna`), `--triage-model` (default: same as `--model`; e.g. `typesafe/jev-1.13` for Jev), `--no-llm`, `--no-triage`, `--no-cisco`.
+Exit code `3` also covers an invalid configuration.
 
-Every scan reports input/output tokens and cost per layer and in total, and `eval` adds a per-skill token table with totals. Costs are the amounts OpenRouter bills. They run slightly above list price because OpenAI charges prompt-cache writes at 1.25× the input price.
+CLI flags, each overriding its `SKILLGUARD_*` variable: `--env-file`, `--backend`, `--model`, `--triage-model`, `--fallback-model`, `--no-llm`, `--no-triage`, `--no-cisco`, and for `eval`, `--workers`.
+
+Every scan reports input/output tokens and cost per layer and in total, and `eval` adds a per-skill token table with totals. Costs are what the provider reports: OpenRouter's billed amount, or LiteLLM's cost calculation. With OpenAI models they run slightly above list price because prompt-cache writes cost 1.25× the input price.
 
 Anything SkillGuard cannot inspect (symlinks, unknown binaries or archives, files over 2 MB, missing `SKILL.md`) is reported as a coverage gap and forces at least REVIEW.
 
@@ -61,4 +109,4 @@ This is a small evaluation, and two rules were written after seeing these sample
 
 ## Privacy
 
-Layers 2 and 3 send skill content to OpenRouter and the model providers. Use `--no-llm --no-triage` for private skills.
+Layers 2 and 3 send skill content to the configured model provider. For private skills, use a local model (LiteLLM + Ollama, above) or `--no-llm --no-triage`.

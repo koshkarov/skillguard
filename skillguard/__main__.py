@@ -1,9 +1,11 @@
 """SkillGuard CLI.
 
     python3 -m skillguard scan <skill-dir> [--md report.md] [--json report.json] [--sarif out.sarif]
-    python3 -m skillguard eval --benign skills/skills --malicious <dir> [<dir> ...] [--out results/]
+    python3 -m skillguard eval --benign <dir> --malicious <dir> [...] [--out results/]
+    python3 -m skillguard config [--example]
 
-Needs an OpenRouter key in OPENROUTER_API_KEY (or `source skills/.env`) unless --no-llm --no-triage.
+Every option can also be set with a SKILLGUARD_* environment variable or in a .env file
+(`python3 -m skillguard config --example` prints them all). CLI flags override the environment.
 """
 
 from __future__ import annotations
@@ -14,18 +16,13 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import report
-from .scanner import DEFAULT_MODEL, scan
+from . import config, report
+from .config import ConfigError
+from .scanner import scan
 from .skill import SkillLoadError
-from .triage import DEFAULT_MODEL as JEV_MODEL
 
 EXIT = {"SAFE": 0, "REVIEW": 1, "BLOCK": 2}
-EXIT_ERROR = 3  # nothing could be scanned; no verdict issued
-
-
-def _scan_args(args) -> dict:
-    return {"model": args.model, "use_llm": not args.no_llm, "use_triage": not args.no_triage,
-            "use_cisco": not args.no_cisco, "triage_model": args.triage_model}
+EXIT_ERROR = 3  # nothing could be scanned, or invalid configuration; no verdict issued
 
 
 def _tokens(tokens_in: int, tokens_out: int) -> str:
@@ -34,7 +31,7 @@ def _tokens(tokens_in: int, tokens_out: int) -> str:
 
 def cmd_scan(args) -> int:
     try:
-        result = scan(Path(args.path), **_scan_args(args))
+        result = scan(Path(args.path))
     except SkillLoadError as exc:
         print(f"ERROR: {exc}; no verdict issued.", file=sys.stderr)
         return EXIT_ERROR
@@ -64,6 +61,7 @@ def _skill_dirs(root: Path) -> list[Path]:
 
 
 def cmd_eval(args) -> int:
+    s = config.settings
     cases = [(p, "benign") for root in args.benign for p in _skill_dirs(Path(root))]
     cases += [(p, "malicious") for root in args.malicious for p in _skill_dirs(Path(root))]
     cases += [(p, "unlabeled") for root in args.unlabeled for p in _skill_dirs(Path(root))]
@@ -73,7 +71,7 @@ def cmd_eval(args) -> int:
     def run(case):
         path, label = case
         try:
-            result = scan(path, **_scan_args(args))
+            result = scan(path)
         except Exception as exc:  # keep evaluating the rest
             return path, label, {"verdict": "ERROR", "reason": str(exc), "cost": 0, "seconds": 0, "layers": [],
                                  "findings": [], "tokens_in": 0, "tokens_out": 0}
@@ -82,7 +80,7 @@ def cmd_eval(args) -> int:
         (out / f"{stem}.json").write_text(json.dumps(result, indent=2))
         return path, label, result
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ThreadPoolExecutor(max_workers=s.workers) as pool:
         rows = list(pool.map(run, cases))
 
     lines = ["| Skill | Label | Verdict | Active findings | Failed layers | Tokens in | Tokens out | Cost | Time |",
@@ -99,11 +97,13 @@ def cmd_eval(args) -> int:
     lines.append(f"| **Total ({len(rows)} skills)** | | | | | **{total_in:,}** | **{total_out:,}** | **${total_cost:.4f}** | |")
     benign = [r for _, l, r in rows if l == "benign"]
     malicious = [r for _, l, r in rows if l == "malicious"]
+
     def share(items, verdicts):
         return f"{sum(r['verdict'] in verdicts for r in items)}/{len(items)}" if items else "n/a"
+
     summary = [
-        "", f"Review model: `{args.model}` · triage model: `{args.triage_model or args.model}` · LLM: {not args.no_llm} · "
-            f"triage: {not args.no_triage} · Cisco: {not args.no_cisco}",
+        "", f"Backend: `{s.backend}` · review model: `{s.model}` · triage model: `{s.effective_triage_model}` · "
+            f"LLM: {s.use_llm} · triage: {s.use_triage} · Cisco: {s.use_cisco}",
         "",
         f"- Malicious caught (BLOCK or REVIEW): **{share(malicious, {'BLOCK', 'REVIEW'})}**, BLOCK: {share(malicious, {'BLOCK'})}",
         f"- Benign false BLOCK: **{share(benign, {'BLOCK'})}**, REVIEW: {share(benign, {'REVIEW'})}, SAFE: {share(benign, {'SAFE'})}",
@@ -117,18 +117,52 @@ def cmd_eval(args) -> int:
     return 0
 
 
+def cmd_config(args) -> int:
+    if args.example:
+        print(config.env_example())
+        return 0
+    width = max(len(env) for env, _, _ in config.settings.describe())
+    for env, value, help_text in config.settings.describe():
+        print(f"{env:<{width}}  {value}")
+    print(f"\nEffective: base URL {config.settings.effective_base_url or '(provider default)'} · "
+          f"triage model {config.settings.effective_triage_model} · "
+          f"fallback {config.settings.effective_fallback_model or '(disabled)'}")
+    return 0
+
+
+def _overrides(args) -> dict:
+    """CLI flags that were given; everything else comes from the environment."""
+    flags = {
+        "backend": getattr(args, "backend", None),
+        "model": getattr(args, "model", None),
+        "triage_model": getattr(args, "triage_model", None),
+        "fallback_model": getattr(args, "fallback_model", None),
+        "workers": getattr(args, "workers", None),
+    }
+    for flag, name in (("no_llm", "use_llm"), ("no_triage", "use_triage"), ("no_cisco", "use_cisco")):
+        if getattr(args, flag, False):
+            flags[name] = False
+    return flags
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="skillguard", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("scan", "eval"):
+    for name in ("scan", "eval", "config"):
         p = sub.add_parser(name)
-        p.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenRouter model for the LLM review (default {DEFAULT_MODEL})")
-        p.add_argument("--no-llm", action="store_true", help="skip the LLM instruction/code review")
-        p.add_argument("--triage-model", default=None,
-                       help="model that triages static findings (default: same as --model, so one model is enough); "
-                            f"use {JEV_MODEL} for TypeSafe Jev")
-        p.add_argument("--no-triage", action="store_true", help="skip triage of static findings")
-        p.add_argument("--no-cisco", action="store_true", help="skip the Cisco scanner")
+        p.add_argument("--env-file", type=Path, help="load settings from this file (default: $SKILLGUARD_ENV_FILE or ./.env)")
+        p.add_argument("--backend", choices=config.BACKENDS, help="LLM backend (SKILLGUARD_BACKEND)")
+        p.add_argument("--model", help="review model (SKILLGUARD_MODEL)")
+        p.add_argument("--triage-model", help="triage model; default same as --model; typesafe/jev-1.13 for Jev "
+                                              "(SKILLGUARD_TRIAGE_MODEL)")
+        p.add_argument("--fallback-model", help="model used when the review model's content filter refuses; "
+                                                "'none' disables (SKILLGUARD_FALLBACK_MODEL)")
+        if name == "config":
+            p.add_argument("--example", action="store_true", help="print a .env template with every setting")
+            continue
+        p.add_argument("--no-llm", action="store_true", help="skip the LLM review (SKILLGUARD_LLM=false)")
+        p.add_argument("--no-triage", action="store_true", help="skip triage (SKILLGUARD_TRIAGE=false)")
+        p.add_argument("--no-cisco", action="store_true", help="skip the Cisco scanner (SKILLGUARD_CISCO=false)")
         if name == "scan":
             p.add_argument("path")
             p.add_argument("--md"), p.add_argument("--json"), p.add_argument("--sarif")
@@ -137,9 +171,16 @@ def main() -> int:
             p.add_argument("--malicious", nargs="*", default=[])
             p.add_argument("--unlabeled", nargs="*", default=[], help="scanned and reported, not scored")
             p.add_argument("--out", default="skillguard-eval")
-            p.add_argument("--workers", type=int, default=4)
+            p.add_argument("--workers", type=int, help="skills scanned in parallel (SKILLGUARD_WORKERS)")
     args = parser.parse_args()
-    return cmd_scan(args) if args.command == "scan" else cmd_eval(args)
+    if args.command == "config" and args.example:
+        return cmd_config(args)  # template only; no need for a valid environment
+    try:
+        config.configure(_overrides(args), env_file=args.env_file)
+    except ConfigError as exc:
+        print(f"CONFIG ERROR: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    return {"scan": cmd_scan, "eval": cmd_eval, "config": cmd_config}[args.command](args)
 
 
 if __name__ == "__main__":

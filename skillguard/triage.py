@@ -14,16 +14,16 @@ import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from . import config
+from .llm import LLMError, add_usage, chat_json, cost_of, jev
 from .model import Finding, LayerStatus, severity_rank
-from .openrouter import LLMError, add_usage, chat_json, cost_of, jev
 from .skill import Skill, numbered
 
 DEFAULT_MODEL = "typesafe/jev-1.13"  # used when triage.run is called without a model (and by tools/jev_filter.py)
 CONTEXT_LINES = 25
 MAX_STATE_CHARS = 60_000
 MAX_TRIAGED = 1000  # safety limit; exceeding it is reported and fails the layer
-KEEP_THRESHOLD = 0.2    # P(true_positive) at or above this always keeps the finding
-DROP_THRESHOLD = 0.6    # P(false_positive) at or above this removes it
+# Keep/drop thresholds: SKILLGUARD_KEEP_THRESHOLD / SKILLGUARD_DROP_THRESHOLD (see config.py).
 
 CRITERIA = {
     "true_positive": (
@@ -85,9 +85,9 @@ def decide(severity: str, result: dict) -> str:
     probs = result.get("probabilities")
     if result.get("verdict") not in CRITERIA or not isinstance(probs, dict):
         return "keep"
-    if probs["true_positive"] >= KEEP_THRESHOLD:
+    if probs["true_positive"] >= config.settings.keep_threshold:
         return "keep"
-    if probs["false_positive"] >= DROP_THRESHOLD:
+    if probs["false_positive"] >= config.settings.drop_threshold:
         return "remove"
     return "downgrade" if severity_rank(severity) > severity_rank("LOW") else "keep"
 

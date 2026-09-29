@@ -2,15 +2,16 @@
 
 A low-cost, pre-install security scanner for agent skills (Claude Code, Codex, Cursor and similar). It should catch most real security problems and explain each one clearly to the person deciding whether to install the skill.
 
-Status: v1.2: v1.1 plus token accounting and single-model operation (D20); v1.1 = v1 plus fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-09-29.
+Status: v1.3: v1.2 plus SKILLGUARD_* configuration and the LiteLLM backend (D21); v1.2 = token accounting and single-model operation (D20); v1.1 = fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-09-29.
 
 Usage:
 ```bash
-export OPENROUTER_API_KEY=sk-or-...      # OpenRouter key
+export SKILLGUARD_API_KEY=sk-or-...      # or put SKILLGUARD_* settings in .env (see .env.example)
 python3 -m skillguard scan <skill-dir> --md report.md --json report.json [--sarif out.sarif]
 python3 -m skillguard eval --benign skills/skills --malicious <dir> --out skillguard-eval/run
+python3 -m skillguard config             # effective settings
 ```
-Exit codes: 0 SAFE, 1 REVIEW, 2 BLOCK, 3 error (nothing scannable, no verdict). Flags: `--model`, `--no-llm`, `--no-triage`, `--no-cisco`. A scan with `--no-llm` or `--no-cisco` is partial and can return BLOCK or REVIEW, never SAFE.
+Exit codes: 0 SAFE, 1 REVIEW, 2 BLOCK, 3 error (nothing scannable or invalid configuration; no verdict). A scan with the LLM review or Cisco turned off is partial and can return BLOCK or REVIEW, never SAFE.
 Tests: `python3 -m unittest discover -s tests` (no network).
 
 ---
@@ -113,6 +114,7 @@ skill folder / zip / git URL
 | D17 | *(v1.1)* **Anything not inspected is a coverage gap → at least REVIEW**: symlinks (never followed), unknown binaries, bundled archives, text files > 2 MB, bundled `node_modules`/venv folders, missing `SKILL.md`. Known media (fonts, images, PDFs) are notes only. | The review found that such files were skipped while the scan reported success. A symlink could also pull files from outside the skill into the LLM prompt. | Silently skipping them (v1). |
 | D18 | *(v1.1)* **A partial scan never returns SAFE; a missing path is an error (exit 3), not a verdict** | `--no-llm --no-cisco` used to return SAFE with only the regex checks run, and a nonexistent path was SAFE too. | Qualified SAFE. |
 | D20 | *(v1.2)* **Triage uses the review model by default; Jev is optional** (`--triage-model`) | Jev is not available to everyone. A chat model gets the same question and answer shape (verdict + three probabilities), batched per skill, and goes through the same validation and decision code. On 54 static findings judged by both, Luna and Jev took the same action on 48; all 6 differences were "remove" vs "downgrade", never keep vs discard. Detection results were identical (8/8 BLOCK, 0/19 benign BLOCK). Triage cost for 27 skills: Luna $0.010, Jev $0.0035. | Jev only (v1); a separate cheap model per layer. |
+| D21 | *(v1.3)* **All configuration through `SKILLGUARD_*` variables (CLI > env > .env file > default); two LLM backends: built-in OpenRouter HTTP client (default, stdlib only) and optional LiteLLM for any provider** | Deployments differ: some teams can't use OpenRouter or Jev, some need local models for private skills. One settings table (`config.py`) generates `.env.example` and `skillguard config`, and no variables are borrowed from other tools. The LiteLLM backend goes through the same answer validation (finish reason, JSON, usage on errors), maps content-policy errors to the content-filter fallback, and takes cost from LiteLLM. Jev stays on its own endpoint (`SKILLGUARD_JEV_BASE_URL`). Verified end to end: gpt-6-luna via both backends gave identical verdicts, tokens within a few percent. | Hard-coded OpenRouter; LiteLLM as a required dependency. |
 | D19 | *(v1.1)* **Validate every external output strictly**: Cisco (exit code, report shape, severities), Jev (choice, all three probabilities finite and summing to ~1), LLM (finish reason, all required fields, the full evidence quote at the cited line) | Malformed or truncated answers were accepted and could downgrade real findings or produce SAFE. | Best-effort parsing (v1). |
 
 ---

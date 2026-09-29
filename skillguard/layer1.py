@@ -12,10 +12,9 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from . import config
 from .model import SEVERITIES, Finding, LayerStatus
 from .skill import Skill, SkillFile, is_license
-
-CISCO_PACKAGE = "cisco-ai-skill-scanner==2.1.0"
 
 # Cisco finding category -> OWASP AST category.
 CISCO_AST = {
@@ -41,13 +40,13 @@ def run_cisco(skill: Skill) -> tuple[list[Finding], LayerStatus]:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "cisco.json"
         cmd = [
-            "uvx", "--quiet", "--from", CISCO_PACKAGE, "skill-scanner", "scan", str(skill.root),
+            "uvx", "--quiet", "--from", config.settings.cisco_package, "skill-scanner", "scan", str(skill.root),
             "--use-behavioral", "--format", "json", "--output", str(out),
         ]
         if not (skill.root / "SKILL.md").exists():
             cmd.append("--lenient")  # e.g. lowercase skill.md, which Cisco otherwise rejects
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=config.settings.cisco_timeout)
             report = json.loads(out.read_text()) if out.exists() else None
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
             return [], LayerStatus("cisco", False, f"Cisco scanner failed: {exc}", time.monotonic() - started)

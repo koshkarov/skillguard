@@ -6,11 +6,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import layer1, semantic, triage
+from . import config, layer1, semantic, triage
 from .model import Finding, LayerStatus, severity_rank
 from .skill import load_skill
 
-DEFAULT_MODEL = "openai/gpt-6-luna"
 BLOCK_CATEGORIES = {"AST01", "AST03"}
 
 
@@ -76,11 +75,17 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
     return unique
 
 
-def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_triage: bool = True,
-         use_cisco: bool = True, triage_model: str | None = None) -> dict:
-    """Scan one skill. `triage_model` defaults to `model`, so a single OpenRouter model is enough."""
+def scan(path: Path, *, model: str | None = None, use_llm: bool | None = None, use_triage: bool | None = None,
+         use_cisco: bool | None = None, triage_model: str | None = None) -> dict:
+    """Scan one skill. Arguments left as None come from the active settings (SKILLGUARD_* variables).
+    The triage model defaults to the review model, so a single model is enough."""
     started = time.monotonic()
-    triage_model = triage_model or model
+    s = config.settings
+    model = model or s.model
+    triage_model = triage_model or s.triage_model or model
+    use_llm = s.use_llm if use_llm is None else use_llm
+    use_triage = s.use_triage if use_triage is None else use_triage
+    use_cisco = s.use_cisco if use_cisco is None else use_cisco
     skill = load_skill(path)
     layers: list[LayerStatus] = []
     findings: list[Finding] = []
@@ -95,7 +100,7 @@ def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_tr
             findings.extend(cisco_findings or [])
             layers.append(cisco_status)
         else:
-            layers.append(LayerStatus("cisco", True, "disabled (--no-cisco)", skipped=True))
+            layers.append(LayerStatus("cisco", True, "disabled (SKILLGUARD_CISCO=false / --no-cisco)", skipped=True))
     findings = _dedupe(findings)
 
     if use_triage:
@@ -104,7 +109,7 @@ def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_tr
         except Exception as exc:  # noqa: BLE001
             layers.append(LayerStatus("triage", False, f"triage crashed: {type(exc).__name__}: {str(exc)[:200]}"))
     else:
-        layers.append(LayerStatus("triage", True, "disabled (--no-triage)", skipped=True))
+        layers.append(LayerStatus("triage", True, "disabled (SKILLGUARD_TRIAGE=false / --no-triage)", skipped=True))
 
     review: dict = {}
     if use_llm:
@@ -116,7 +121,7 @@ def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_tr
             semantic_status = LayerStatus("semantic", False, f"LLM review crashed: {type(exc).__name__}: {str(exc)[:200]}")
         layers.append(semantic_status)
     else:
-        layers.append(LayerStatus("semantic", True, "disabled (--no-llm)", skipped=True))
+        layers.append(LayerStatus("semantic", True, "disabled (SKILLGUARD_LLM=false / --no-llm)", skipped=True))
 
     findings.sort(key=lambda f: (f.status != "active", -severity_rank(f.severity), f.ast, f.location))
     label, reason = verdict(findings, review, layers)
@@ -131,6 +136,7 @@ def scan(path: Path, *, model: str = DEFAULT_MODEL, use_llm: bool = True, use_tr
         "cost": round(sum(layer.cost for layer in layers), 6),
         "tokens_in": sum(layer.tokens_in for layer in layers),
         "tokens_out": sum(layer.tokens_out for layer in layers),
+        "config": {"backend": s.backend, "model": model, "triage_model": triage_model},
         "seconds": round(time.monotonic() - started, 2),
         "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     }

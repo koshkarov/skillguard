@@ -23,8 +23,9 @@ Usage:
     skill-scanner scan <skill> --use-behavioral --format json --output cisco.json
     python jev_filter.py cisco.json -o filtered.json --md filtered.md
 
-Auth: OPENROUTER_API_KEY. Stdlib only; uses the Jev validation and decision policy from the
-skillguard package in this repo, so both tools always treat Jev answers the same way.
+Configuration: the same SKILLGUARD_* variables / .env file as SkillGuard (key: SKILLGUARD_JEV_API_KEY or
+SKILLGUARD_API_KEY; thresholds: SKILLGUARD_KEEP_THRESHOLD / SKILLGUARD_DROP_THRESHOLD). Stdlib only; uses
+the Jev validation and decision policy from the skillguard package, so both tools treat Jev answers alike.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root, for the skillguard package
-from skillguard import openrouter, triage  # noqa: E402  shared Jev call, validation and decision policy
+from skillguard import config, triage  # noqa: E402  shared settings, Jev call, validation and decision policy
 
 CONTEXT_LINES = 25          # source lines shown before/after the finding
 MAX_STATE_CHARS = 60_000    # Jev limit is ~64k tokens total; stay well under
@@ -200,16 +201,18 @@ def main() -> int:
     parser.add_argument("-o", "--output", type=Path, help="filtered JSON output")
     parser.add_argument("--md", type=Path, help="markdown summary output")
     parser.add_argument("--skill-dir", type=Path, help="skill source dir (default: skill.source in report)")
-    parser.add_argument("--drop-threshold", type=float, default=triage.DROP_THRESHOLD, help="min P(false_positive) to remove")
-    parser.add_argument("--keep-threshold", type=float, default=triage.KEEP_THRESHOLD, help="P(true_positive) that always keeps")
+    parser.add_argument("--drop-threshold", type=float, help="min P(false_positive) to remove (SKILLGUARD_DROP_THRESHOLD)")
+    parser.add_argument("--keep-threshold", type=float, help="P(true_positive) that always keeps (SKILLGUARD_KEEP_THRESHOLD)")
+    parser.add_argument("--env-file", type=Path, help="settings file (default: $SKILLGUARD_ENV_FILE or ./.env)")
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
-    triage.DROP_THRESHOLD, triage.KEEP_THRESHOLD = args.drop_threshold, args.keep_threshold
-
     try:
-        openrouter.api_key()
-    except openrouter.LLMError as exc:
-        sys.exit(str(exc))
+        settings = config.configure({"drop_threshold": args.drop_threshold, "keep_threshold": args.keep_threshold},
+                                    env_file=args.env_file)
+    except config.ConfigError as exc:
+        sys.exit(f"CONFIG ERROR: {exc}")
+    if not settings.effective_jev_api_key:
+        sys.exit("No key for Jev: set SKILLGUARD_JEV_API_KEY or SKILLGUARD_API_KEY.")
 
     report = json.loads(args.report.read_text())
     list_key, source, skill_name, issues, originals = load_report(report)

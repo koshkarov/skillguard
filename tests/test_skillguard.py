@@ -13,9 +13,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from skillguard import layer1, openrouter, report, scanner, semantic, triage
+from skillguard import config, layer1, llm, report, scanner, semantic, triage
 from skillguard.model import Finding, LayerStatus
-from skillguard.skill import MAX_FILE_BYTES, SkillFile, SkillLoadError, load_skill
+from skillguard.skill import SkillFile, SkillLoadError, load_skill
 
 MANIFEST = "---\nname: sample\ndescription: A sample skill for tests.\n---\n# Sample\n\nDoes nothing.\n"
 
@@ -77,7 +77,7 @@ class LoaderTests(unittest.TestCase):
         self.assertFalse(skill.coverage_gaps)
 
     def test_oversized_text_file_is_a_coverage_gap(self):
-        root = make_skill({"SKILL.md": MANIFEST, "big.md": "a" * (MAX_FILE_BYTES + 1)})
+        root = make_skill({"SKILL.md": MANIFEST, "big.md": "a" * (config.settings.max_file_bytes + 1)})
         self.assertTrue(any("big.md" in g for g in load_skill(root).coverage_gaps))
 
     def test_unknown_binary_is_a_gap_but_media_is_not(self):
@@ -227,7 +227,7 @@ class TriageTests(unittest.TestCase):
 
     def test_chat_model_error_counts_tokens(self):
         skill, findings = self._llm_setup(1)
-        err = openrouter.LLMError("incomplete answer", {"prompt_tokens": 7, "completion_tokens": 3})
+        err = llm.LLMError("incomplete answer", {"prompt_tokens": 7, "completion_tokens": 3})
         with mock.patch.object(triage, "chat_json", side_effect=err):
             status = triage.run(skill, findings, model="openai/gpt-6-luna")
         self.assertFalse(status.ok)
@@ -303,7 +303,7 @@ class SemanticTests(unittest.TestCase):
         skill = load_skill(make_skill({"SKILL.md": manifest, "run.py": "print(1)\n"}))
         system_chars = 5_000
         prompts, _ = semantic.build_prompts(skill, [], "n0nce", system_chars=system_chars)
-        self.assertTrue(all(len(p) + system_chars <= semantic.MAX_PROMPT_CHARS for p in prompts))
+        self.assertTrue(all(len(p) + system_chars <= config.settings.max_prompt_chars for p in prompts))
         covered = sum(p.count("word ") for p in prompts)
         self.assertGreaterEqual(covered, 80_000)  # nothing dropped (the context copy may repeat some)
         self.assertTrue(any("run.py" in p for p in prompts))
@@ -322,9 +322,9 @@ class SemanticTests(unittest.TestCase):
 
     def test_truncated_answer_rejected(self):
         body = {"choices": [{"finish_reason": "length", "message": {"content": '{"intent": "benign", "findings": []}'}}]}
-        with mock.patch.object(openrouter, "post", return_value=body):
-            with self.assertRaises(openrouter.LLMError):
-                openrouter.chat_json("m", "s", "u")
+        with mock.patch.object(llm, "post", return_value=body):
+            with self.assertRaises(llm.LLMError):
+                llm.chat_json("m", "s", "u")
 
     def test_merge_uses_worst_behavior(self):
         a = {"intent": "benign", "declared_purpose": "p", "actual_behavior": "only formatting", "summary": "ok", "findings": []}
@@ -332,6 +332,131 @@ class SemanticTests(unittest.TestCase):
         merged = semantic.merge_reviews([a, b])
         self.assertEqual((merged["intent"], merged["actual_behavior"], merged["summary"]), ("malicious", "uploads files", "bad"))
         self.assertEqual(len(merged["findings"]), 1)
+
+
+# --- Configuration and LiteLLM backend -------------------------------------------------------------------
+
+class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.saved_env = dict(os.environ)
+        self.saved_settings = config.settings
+        for key in [k for k in os.environ if k.startswith("SKILLGUARD_")]:
+            del os.environ[key]
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved_env)
+        config.settings = self.saved_settings
+
+    def test_defaults(self):
+        s = config.load()
+        self.assertEqual((s.backend, s.model, s.effective_triage_model), ("openrouter", "openai/gpt-6-luna", "openai/gpt-6-luna"))
+        self.assertEqual(s.effective_base_url, config.OPENROUTER_URL)
+
+    def test_every_setting_comes_from_its_env_var(self):
+        os.environ.update({"SKILLGUARD_BACKEND": "litellm", "SKILLGUARD_MODEL": "anthropic/x",
+                           "SKILLGUARD_LLM": "false", "SKILLGUARD_KEEP_THRESHOLD": "0.3",
+                           "SKILLGUARD_MAX_FILE_BYTES": "1000", "SKILLGUARD_FALLBACK_MODEL": "none"})
+        s = config.load()
+        self.assertEqual((s.backend, s.model, s.use_llm, s.keep_threshold, s.max_file_bytes),
+                         ("litellm", "anthropic/x", False, 0.3, 1000))
+        self.assertEqual(s.effective_fallback_model, "")
+        self.assertEqual(s.effective_base_url, "")  # LiteLLM: provider default
+        self.assertEqual(len(config.SETTINGS), len(s.describe()))
+        self.assertTrue(all(env.startswith("SKILLGUARD_") for env, _, _ in s.describe()))
+
+    def test_cli_overrides_beat_environment(self):
+        os.environ["SKILLGUARD_MODEL"] = "from-env"
+        self.assertEqual(config.load({"model": "from-cli", "workers": None}).model, "from-cli")
+
+    def test_env_file_does_not_override_environment(self):
+        env_file = Path(tempfile.mkdtemp()) / "sg.env"
+        env_file.write_text('# comment\nexport SKILLGUARD_MODEL="file-model"\nSKILLGUARD_BACKEND=litellm  # note\n')
+        os.environ["SKILLGUARD_BACKEND"] = "openrouter"
+        s = config.configure(env_file=env_file)
+        self.assertEqual((s.model, s.backend), ("file-model", "openrouter"))
+
+    def test_invalid_values_rejected(self):
+        for key, value in [("SKILLGUARD_BACKEND", "nope"), ("SKILLGUARD_LLM", "maybe"),
+                           ("SKILLGUARD_DROP_THRESHOLD", "2"), ("SKILLGUARD_WORKERS", "x")]:
+            os.environ[key] = value
+            with self.assertRaises(config.ConfigError, msg=key):
+                config.load()
+            del os.environ[key]
+
+    def test_no_foreign_key_fallback(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-or-foreign"
+        config.settings = config.load()
+        with self.assertRaises(llm.LLMError):
+            llm.api_key()
+
+    def test_env_example_lists_every_setting(self):
+        example = config.env_example()
+        for spec in config.SETTINGS.values():
+            self.assertIn(f"{spec.env}=", example)
+
+
+class LiteLLMBackendTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = config.settings
+        config.settings = config.load({"backend": "litellm", "api_key": "k", "base_url": "http://proxy.invalid"})
+        self.calls = []
+
+    def tearDown(self):
+        config.settings = self.saved
+
+    def fake_litellm(self, content='{"a": 1}', finish="stop", error=None, cost=0.0012):
+        from types import SimpleNamespace
+        calls = self.calls
+
+        def completion(**kwargs):
+            calls.append(kwargs)
+            if error:
+                raise error
+            return SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason=finish, message=SimpleNamespace(content=content, refusal=None))],
+                usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20),
+                _hidden_params={"response_cost": cost})
+        return SimpleNamespace(completion=completion, completion_cost=lambda **_: None)
+
+    def test_litellm_call_parameters_and_usage(self):
+        with mock.patch.dict("sys.modules", {"litellm": self.fake_litellm()}):
+            data, usage = llm.chat_json("anthropic/claude-x", "sys", "user", max_tokens=50)
+        self.assertEqual(data, {"a": 1})
+        self.assertEqual(usage, {"prompt_tokens": 100, "completion_tokens": 20, "cost": 0.0012})
+        call = self.calls[0]
+        self.assertEqual((call["model"], call["api_key"], call["api_base"], call["max_tokens"]),
+                         ("anthropic/claude-x", "k", "http://proxy.invalid", 50))
+        self.assertEqual(call["response_format"], {"type": "json_object"})
+        self.assertEqual(call["temperature"], 0.0)
+
+    def test_litellm_truncated_answer_rejected_with_usage(self):
+        with mock.patch.dict("sys.modules", {"litellm": self.fake_litellm(finish="length")}):
+            with self.assertRaises(llm.LLMError) as ctx:
+                llm.chat_json("m", "s", "u")
+        self.assertEqual(ctx.exception.usage["prompt_tokens"], 100)
+
+    def test_litellm_content_policy_maps_to_content_filter(self):
+        class ContentPolicyViolationError(Exception):
+            pass
+        with mock.patch.dict("sys.modules", {"litellm": self.fake_litellm(error=ContentPolicyViolationError("no"))}):
+            with self.assertRaises(llm.LLMError) as ctx:
+                llm.chat_json("m", "s", "u")
+        self.assertIn("content_filter", str(ctx.exception))
+
+    def test_missing_litellm_package_explains_install(self):
+        with mock.patch.dict("sys.modules", {"litellm": None}):
+            with self.assertRaises(llm.LLMError) as ctx:
+                llm.chat_json("m", "s", "u")
+        self.assertIn("pip install litellm", str(ctx.exception))
+
+    def test_http_backend_sends_openrouter_usage_flag_only_to_openrouter(self):
+        body = {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}], "usage": {}}
+        for base, expect in [("", True), ("http://litellm-proxy.invalid:4000", False)]:
+            config.settings = config.load({"backend": "openrouter", "api_key": "k", "base_url": base})
+            with mock.patch.object(llm, "post", return_value=body) as post:
+                llm.chat_json("m", "s", "u")
+            self.assertEqual("usage" in post.call_args[0][1], expect, base)
 
 
 class ReportTests(unittest.TestCase):
