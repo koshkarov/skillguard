@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skillguard"
+dynamic = ["version"]
+description = "Low-cost security scanner for AI agent skills, mapped to the OWASP Agentic Skills Top 10"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "See repository" }
+dependencies = []  # standard library only; the Cisco scanner runs through uvx
+
+[project.optional-dependencies]
+litellm = ["litellm"]
+
+[project.scripts]
+skillguard = "skillguard.__main__:main"
+
+[tool.setuptools]
+packages = ["skillguard"]
+
+[tool.setuptools.dynamic]
+version = { attr = "skillguard.__version__" }

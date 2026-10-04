@@ -1,0 +1,90 @@
+name: SkillGuard
+description: Scan AI agent skills for security issues (OWASP Agentic Skills Top 10) and gate the build on the verdict.
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  paths:
+    description: Space-separated skill folders, .zip/.skill packages, or folders searched for skills (any depth).
+    default: "."
+  fail-on:
+    description: "Fail the step on: 'block' (default), 'review' (REVIEW or BLOCK), or 'never'. Scan errors always fail."
+    default: block
+  api-key:
+    description: LLM API key (SKILLGUARD_API_KEY). Without it, pass --no-llm --no-triage in `args` for a free partial scan.
+    default: ""
+  model:
+    description: Review model (SKILLGUARD_MODEL); empty = SkillGuard default.
+    default: ""
+  backend:
+    description: "'openrouter' (default) or 'litellm'."
+    default: ""
+  policy:
+    description: Policy file with suppressions and approvals. Protect it with CODEOWNERS.
+    default: ""
+  sarif:
+    description: Where to write SARIF for github/codeql-action/upload-sarif; empty = none.
+    default: skillguard.sarif
+  args:
+    description: Extra CLI arguments, e.g. "--no-cisco".
+    default: ""
+  cache:
+    description: Reuse results for unchanged skills across runs (actions/cache).
+    default: "true"
+
+outputs:
+  verdict:
+    description: Worst verdict over all scanned skills (SAFE, REVIEW, BLOCK or ERROR).
+    value: ${{ steps.scan.outputs.verdict }}
+  report:
+    description: Path of the Markdown report.
+    value: ${{ steps.scan.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v6
+
+    - if: inputs.cache == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/skillguard
+        key: skillguard-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: skillguard-${{ runner.os }}-
+
+    - id: scan
+      shell: bash
+      # Inputs reach the script only through environment variables, never by interpolation into the code.
+      env:
+        SG_PATHS: ${{ inputs.paths }}
+        SG_FAIL_ON: ${{ inputs.fail-on }}
+        SG_SARIF: ${{ inputs.sarif }}
+        SG_ARGS: ${{ inputs.args }}
+        SG_ACTION_PATH: ${{ github.action_path }}
+        SKILLGUARD_API_KEY: ${{ inputs.api-key }}
+        SKILLGUARD_MODEL: ${{ inputs.model }}
+        SKILLGUARD_BACKEND: ${{ inputs.backend }}
+        SKILLGUARD_POLICY: ${{ inputs.policy }}
+      run: |
+        set -uo pipefail
+        case "$SG_FAIL_ON" in block|review|never) ;; *) echo "::error::fail-on must be block, review or never"; exit 3 ;; esac
+        read -ra paths <<< "$SG_PATHS"
+        read -ra extra <<< "$SG_ARGS"
+        out="$RUNNER_TEMP/skillguard"
+        mkdir -p "$out"
+        with=()
+        [ "${SKILLGUARD_BACKEND:-}" = litellm ] && with=(--with litellm)
+        sarif=()
+        [ -n "$SG_SARIF" ] && sarif=(--sarif "$SG_SARIF")
+        uvx "${with[@]}" --from "$SG_ACTION_PATH" skillguard scan "${paths[@]}" \
+          --md "$out/report.md" --json "$out/report.json" "${sarif[@]}" "${extra[@]}"
+        code=$?
+        verdict=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("verdict","ERROR"))' "$out/report.json" 2>/dev/null || echo ERROR)
+        echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+        echo "report=$out/report.md" >> "$GITHUB_OUTPUT"
+        [ -f "$out/report.md" ] && head -c 900000 "$out/report.md" >> "$GITHUB_STEP_SUMMARY"
+        if [ "$code" -ge 3 ]; then echo "::error::SkillGuard could not complete the scan (exit $code)"; exit "$code"; fi
+        if [ "$SG_FAIL_ON" = block ] && [ "$code" -ge 2 ]; then echo "::error::SkillGuard verdict: $verdict"; exit "$code"; fi
+        if [ "$SG_FAIL_ON" = review ] && [ "$code" -ge 1 ]; then echo "::error::SkillGuard verdict: $verdict"; exit "$code"; fi
+        echo "SkillGuard verdict: $verdict"

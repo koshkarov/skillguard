@@ -249,6 +249,11 @@ def run(skill: Skill, hints: list[Finding], model: str) -> tuple[dict, list[Find
     nonce = secrets.token_hex(6)
     system = SYSTEM.format(nonce=nonce)
     prompts, data_files = build_prompts(skill, hints, nonce, system_chars=len(system))
+    limit = config.settings.max_review_calls
+    if len(prompts) > limit:  # cost cap: spend nothing rather than an unbounded amount on one skill
+        return {}, [], LayerStatus("semantic", False, f"skill too large for the LLM review: needs {len(prompts)} "
+                                   f"calls, limit is {limit} (SKILLGUARD_MAX_REVIEW_CALLS)",
+                                   time.monotonic() - started)
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(lambda p: _review_chunk(model, system, p), prompts))
     spent = [(model, usage) for _, usage, _ in results]  # every call made, for tokens and cost

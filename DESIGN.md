@@ -2,7 +2,7 @@
 
 A low-cost, pre-install security scanner for agent skills (Claude Code, Codex, Cursor and similar). It should catch most real security problems and explain each one clearly to the person deciding whether to install the skill.
 
-Status: v1.3: v1.2 plus SKILLGUARD_* configuration and the LiteLLM backend (D21); v1.2 = token accounting and single-model operation (D20); v1.1 = fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-09-29.
+Status: v1.4: enterprise use: result cache, review-call cap, bundled-archive inspection, .zip/.skill input, multi-skill scans, policy file, hardened reports, GitLab Code Quality + SAST reports and CI template, SARIF for GitHub, packaging, GitHub Action, Docker (D22–D29, section 15); v1.3 = SKILLGUARD_* configuration and the LiteLLM backend (D21); v1.2 = token accounting and single-model operation (D20); v1.1 = fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-10-04.
 
 Usage:
 ```bash
@@ -106,7 +106,7 @@ skill folder / zip / git URL
 | D9 | **Report the risks we can't assess** (AST06, AST09, most of AST10) | Honest about the limits of scanning a package; avoids false confidence. | Omitting them. |
 | D10 | **Never execute skill code** | Safety, so malicious samples can be scanned. OWASP's dynamic testing (1.5, 8.5) is left for a later sandboxed stage. | Dynamic analysis now: too costly and risky for v1. |
 | D11 | **Build a test set before the scanner, and tune against it** | Without test data we cannot claim "catches most issues". OWASP ships no fixture corpus. | Tuning by inspection: that is how we'd end up with a noisy tool. |
-| D12 | **Python, standard library + `uvx` for Cisco** | Matches the rest of the tooling and needs no heavy dependencies. `tools/jev_filter.py` is already stdlib-only. | — |
+| D12 | **Python, standard library + `uvx` for Cisco** | Matches the rest of the tooling and needs no heavy dependencies. `tools/jev_filter.py` is already stdlib-only. *(v1.4: Python 3.11+, for `tomllib`; 3.10 reaches end of life in October 2026.)* | — |
 | D13 | *(added after evaluation)* **A single LLM finding can't BLOCK; the LLM blocks only through its overall `intent`** | In the first run, one over-rated finding (API fallback documentation in `claude-api`) caused a false BLOCK, even though the same review rated the intent "risky but legitimate". | Letting any verified HIGH LLM finding block. |
 | D14 | *(added)* **Large skills are split into several LLM calls, with SKILL.md in each; pure data files (`.xsd`, `.xml`, `.css`, `.svg`, `.csv`, JSON > 100 KB) are checked by Layer 1 only** | 4 of 19 real skills were too large for one call. The Office skills are mostly XML schemas, which are data, not instructions. The files skipped are listed in the report. | Raising the budget (cost), or dropping files (silent gaps). |
 | D15 | *(added)* **If the reviewer model's content filter refuses, re-review with a fallback model (GPT-6 Luna)** | Sonnet 5.5 via OpenRouter refused to review the malicious test skill (`finish_reason=content_filter`), because the request contains malicious code. The filter blocks exactly the skills that most need review. | Treating the refusal as a failure only (still safe through fail-closed, but it loses the explanation). |
@@ -115,6 +115,14 @@ skill folder / zip / git URL
 | D18 | *(v1.1)* **A partial scan never returns SAFE; a missing path is an error (exit 3), not a verdict** | `--no-llm --no-cisco` used to return SAFE with only the regex checks run, and a nonexistent path was SAFE too. | Qualified SAFE. |
 | D20 | *(v1.2)* **Triage uses the review model by default; Jev is optional** (`--triage-model`) | Jev is not available to everyone. A chat model gets the same question and answer shape (verdict + three probabilities), batched per skill, and goes through the same validation and decision code. On 54 static findings judged by both, Luna and Jev took the same action on 48; all 6 differences were "remove" vs "downgrade", never keep vs discard. Detection results were identical (8/8 BLOCK, 0/19 benign BLOCK). Triage cost for 27 skills: Luna $0.010, Jev $0.0035. | Jev only (v1); a separate cheap model per layer. |
 | D21 | *(v1.3)* **All configuration through `SKILLGUARD_*` variables (CLI > env > .env file > default); two LLM backends: built-in OpenRouter HTTP client (default, stdlib only) and optional LiteLLM for any provider** | Deployments differ: some teams can't use OpenRouter or Jev, some need local models for private skills. One settings table (`config.py`) generates `.env.example` and `skillguard config`, and no variables are borrowed from other tools. The LiteLLM backend goes through the same answer validation (finish reason, JSON, usage on errors), maps content-policy errors to the content-filter fallback, and takes cost from LiteLLM. Jev stays on its own endpoint (`SKILLGUARD_JEV_BASE_URL`). Verified end to end: gpt-6-luna via both backends gave identical verdicts, tokens within a few percent. | Hard-coded OpenRouter; LiteLLM as a required dependency. |
+| D22 | *(v1.4)* **Cache complete results by content hash** (every file, including uninspected ones) plus every result-affecting setting and the SkillGuard version; failed scans are never cached; policy is applied after the cache | Organisations re-scan the same skills on every CI run and every pull request; most of them have not changed. A cache hit is free and takes milliseconds. Keying on content (not path or mtime) means a change to any file, even in an unscanned `node_modules`, forces a fresh scan. | No cache (cost grows with CI runs, not with changes); path/mtime keys (stale after a swap). |
+| D23 | *(v1.4)* **Hard cap on LLM review calls per skill** (`SKILLGUARD_MAX_REVIEW_CALLS`, default 8); over the cap the review is not run and is marked failed | D14 splits large skills into several calls, so cost had no upper bound. Exceeding the cap is rare and unusual, so fail-closed REVIEW is the right outcome, not a silent partial review. | Truncating the skill (silent coverage gap); no cap. |
+| D24 | *(v1.4)* **Inspect bundled zip/tar archives in memory**; links, encrypted, nested, oversized or unreadable members are coverage gaps; reading stops at the first oversized tar member | An uninspected archive could only ever cause REVIEW, so a malicious payload inside one was never able to BLOCK; it was also the cause of one benign REVIEW (`web-artifacts-builder`). Reading in memory never writes to disk, so path traversal does not apply. | Extracting to disk; treating all archives as gaps (v1.1). |
+| D25 | *(v1.4)* **Accept `.zip`/`.skill` packages** with safe extraction (no absolute or `..` paths, no links, size budgets, duplicate entries are gaps) | Skills are distributed as packages; scanning the package that will be installed is better than scanning a copy someone unpacked. Duplicate entries make the installed content ambiguous. | Requiring users to unpack (and possibly unpack unsafely). |
+| D26 | *(v1.4)* **Policy file: suppressions and approvals with a required reason, optional expiry and sha256 pins; approvals pin the whole content hash and never override BLOCK; loaded only from an explicit path** | Organisations need to record reviewed decisions instead of disabling checks. Pinning to hashes means an exception lapses when the reviewed content changes (OWASP AST07 update drift); expiry forces re-review (AST09). Auto-discovering a policy next to a skill would let a skill exempt itself. | Disabling rules globally; inline suppression comments in skills (author-controlled). |
+| D27 | *(v1.4)* **Escape all untrusted text in Markdown reports** (skill content, Cisco output, LLM answers); fences longer than any backtick run inside | Reports are posted as PR comments and job summaries. Before, a skill could close the evidence fence and inject a fake "✅ SAFE" heading, links, images (tracking) or HTML. | Trusting scanner output. |
+| D28 | *(v1.4)* **Distribution: pip package with a `skillguard` command, a composite GitHub Action, a non-root Docker image with the pinned Cisco scanner pre-fetched (`UV_OFFLINE=1`)** | CI integration is how scanning becomes routine. The image makes the static layers work air-gapped (verified with `--network none`). Action inputs reach the shell only via environment variables (no script injection). | — |
+| D29 | *(v1.4)* **GitLab support: Code Quality and SAST (schema 15.2.1) reports plus an includable CI template; REVIEW = allowed failure (exit code 1), BLOCK and errors fail the job** | GitLab does not read SARIF. Code Quality works on every tier and puts findings in the merge request; the SAST report adds the security widget and Vulnerability Report on Ultimate. Allowed failure gives REVIEW a visible "warning" state without blocking merges by default. Policy-suppressed findings are left out of both (neither format has suppressions). | SARIF only; a custom MR-comment bot (needs an API token). |
 | D19 | *(v1.1)* **Validate every external output strictly**: Cisco (exit code, report shape, severities), Jev (choice, all three probabilities finite and summing to ~1), LLM (finish reason, all required fields, the full evidence quote at the cited line) | Malformed or truncated answers were accepted and could downgrade real findings or produce SAFE. | Best-effort parsing (v1). |
 
 ---
@@ -168,6 +176,7 @@ Derived from the OWASP checklist (numbers refer to `checklist.md` items).
 | ⛔ BLOCK | Layer 2 intent = `malicious` **or** a Layer 1 HIGH/CRITICAL in AST01/03 confirmed independently of the LLM review (precise check, or Jev P(TP) ≥ 0.5). A Layer 2 finding on its own never blocks (D13). |
 | ⚠️ REVIEW | Any remaining HIGH, or Layer 2 intent = `suspicious`, **or any layer failed**, **or a coverage layer (checks, Cisco, LLM review) was skipped**, **or any coverage gap** (see D17) |
 | ✅ SAFE | Only for a complete scan with none of the above. LOW/INFO findings are still listed as notes. Skipping triage alone does not prevent SAFE, since triage only removes noise. |
+| Policy *(v1.4)* | Findings suppressed by policy do not count. A policy approval for the exact content hash turns REVIEW into SAFE; BLOCK is never overridden. The automatic verdict is kept as `verdict_before_policy`. |
 
 The thresholds are starting values, to be tuned on the test set (section 9).
 
@@ -216,6 +225,7 @@ For comparison: SkillSpector + Sonnet ~$1.11 per skill, and Cisco + Sonnet ~$0.2
 - **Prompt injection against the scanner itself**: a malicious skill can try to talk the Layer 2 model into saying "benign". Mitigation: skill content is clearly delimited as untrusted data, Layer 1 evidence is independent of the LLM, and a Layer 2 "benign" verdict never overrides a confirmed Layer 1 HIGH finding.
 - **Cisco dependency**: its output format could change. Pin the version and keep a thin adapter (as in `tools/jev_filter.py`).
 - **Large skills**: may exceed a single LLM call; this needs a chunking rule that never silently drops files.
+- **Policy and cache are trusted inputs** *(v1.4)*: whoever can edit the policy file or write to the cache directory can change verdicts. Mitigation: explicit policy path only, CODEOWNERS on the policy file, reasons and expiries required, hash pins; the cache lives in a per-user directory or a per-repository CI cache.
 - **Known scanner bug**: SkillSpector's `static_parse_limit` treats JavaScript template literals in HTML as shell code (AE1 false positive). This is only relevant if SkillSpector is added as a second engine.
 
 ---
@@ -293,6 +303,24 @@ An external review found 14 bugs. All are fixed and covered by regression tests 
 Also: credential regex covers `.env.local`, `~/.aws` and `credentials.json`; base64 check requires entropy ≥ 4 bits/char; `tools/jev_filter.py` now uses the same Jev validation and decision code as SkillGuard; an unknown verdict renders instead of crashing; transient HTTP 52x errors are retried.
 
 Regression after the fixes (Luna): malicious 8/8 BLOCK; benign 0/19 BLOCK, 3/19 REVIEW. The REVIEWs: `web-artifacts-builder` ships a `.tar.gz` of source code that it extracts into the user's project and that nobody inspects (a correct new coverage gap; inspecting archives is a possible follow-up); `claude-api` hit a transient HTTP 520 in triage (now retried); `skill-creator`'s real script-injection issue was rated HIGH this run instead of MEDIUM (LLM variance).
+
+## 15. Enterprise readiness (v1.4, 2026-10-04)
+
+Goal: make SkillGuard routine to run across an organisation's skills, while keeping cost per change near zero and the verdict trustworthy.
+
+| Need | What changed |
+|---|---|
+| Cost proportional to change, not to CI runs | Content-hash result cache (D22); review-call cap (D23). Measured: a repeat scan went from 16.6 s to 0.0 s with $0 spent. |
+| No blind spots in packaged content | Bundled archives inspected in memory (D24): a credential-exfiltration instruction inside a `.tar.gz` now BLOCKs instead of stopping at REVIEW. `.zip`/`.skill` packages scanned directly (D25). |
+| Many skills per run | `scan` takes several paths and finds every `SKILL.md` folder at any depth (not inside another skill, not in `.git`/`node_modules`); one summary, per-skill reports (`--out`), worst-verdict exit code; one broken skill is reported as an error without hiding the others. |
+| Governance and audit | Policy file (D26); `skillguard approve` prints an approval pinned to the current content; reports carry `content_sha256`, the SkillGuard version, cache and policy details. |
+| CI integration | GitLab: Code Quality + SAST reports and a CI template (D29), validated against GitLab's CI and SAST schemas and run in the job image. GitHub: SARIF 2.1.0 with rule metadata, `security-severity`, paths relative to the repository, stable `partialFingerprints`, native `suppressions`; GitHub Action with `fail-on`, job summary, cache (D28). |
+| Safe output | Markdown escaping of untrusted text (D27). |
+| Distribution | `pyproject.toml` (`pip install`, `skillguard` command, `[litellm]` extra), Docker image (non-root, offline static layers), CI workflow testing Python 3.11–3.13, the Action and the image. |
+
+Tests: 82 (no network), including archive bombs/links/traversal/duplicates, policy hash pins and expiry, cache hits and invalidation, the call cap, report injection and SARIF.
+
+Next steps (not done): sign and publish the image and package; a SkillSpector second engine if evaluation shows recall gaps; a larger labeled test set (section 13).
 
 ## References
 

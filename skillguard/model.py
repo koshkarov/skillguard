@@ -46,7 +46,8 @@ class Finding:
     precise: bool = False       # high-precision check: skip triage
     triage: dict = field(default_factory=dict)
     original_severity: str | None = None
-    status: str = "active"      # "active", "downgraded", "removed"
+    status: str = "active"      # "active", "downgraded", "removed", "suppressed" (by policy)
+    suppression: dict = field(default_factory=dict)   # policy reason/expiry when suppressed
 
     def to_dict(self) -> dict:
         return asdict(self)
