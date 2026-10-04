@@ -1,4 +1,5 @@
-"""Render scan results as Markdown (for people) and SARIF (for CI).
+"""Render scan results as Markdown (for people), SARIF (GitHub and other CI), and GitLab reports
+(Code Quality for the merge request widget on every tier; SAST for the security dashboard on Ultimate).
 
 Everything shown from a skill, the Cisco scanner or the LLM is untrusted: Markdown output escapes it, so
 a skill cannot inject links, images, HTML or fake report sections when a report is posted as a PR comment.
@@ -9,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import time
+import uuid
 from pathlib import Path
 
 from . import __version__
@@ -193,6 +196,89 @@ def _artifact_uri(skill_path: str, file: str | None, base: Path) -> str:
         return target.as_posix()
 
 
+def _fingerprint(result: dict, finding: dict) -> str:
+    """Stable across runs and line shifts: skill, rule, file and evidence, not the line number."""
+    identity = f"{result['skill']['name']}|{finding['rule']}|{finding.get('file')}|{finding.get('evidence', '')[:200]}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _reportable(results: list[dict]):
+    """(result, finding) pairs for CI reports: removed (false positive) and policy-suppressed are left out."""
+    for result in results:
+        for finding in result["findings"]:
+            if finding["status"] not in ("removed", "suppressed"):
+                yield result, finding
+
+
+def _ci_text(result: dict, f: dict) -> str:
+    member = f" ({f['file']})" if "!/" in (f.get("file") or "") else ""
+    return f"[{result['skill']['name']}] {f['title']}{member}"
+
+
+CODEQUALITY_SEVERITY = {"CRITICAL": "blocker", "HIGH": "critical", "MEDIUM": "major", "LOW": "minor", "INFO": "info"}
+
+
+def to_codequality(results: dict | list[dict], base: Path | None = None) -> list[dict]:
+    """GitLab Code Quality report (`artifacts:reports:codequality`): shown in the merge request widget on
+    every GitLab tier. Paths are relative to `base` (the project directory in CI)."""
+    results = [results] if isinstance(results, dict) else results
+    base = base or Path.cwd()
+    return [{
+        "description": f"{_ci_text(result, f)}. {f['why']} Fix: {f['fix']}".strip()[:2000],
+        "check_name": f"skillguard:{f['ast']}/{f['rule']}",
+        "fingerprint": _fingerprint(result, f),
+        "severity": CODEQUALITY_SEVERITY.get(f["severity"], "major"),
+        "categories": ["Security"],
+        "location": {"path": _artifact_uri(result["skill"]["path"], f.get("file"), base),
+                     "lines": {"begin": f["line"] if f.get("line") and "!/" not in (f.get("file") or "") else 1}},
+    } for result, f in _reportable(results)]
+
+
+GITLAB_SAST_VERSION = "15.2.1"
+
+
+def to_gitlab_sast(results: dict | list[dict], base: Path | None = None, started: float | None = None) -> dict:
+    """GitLab SAST report (`artifacts:reports:sast`, schema 15.2.1): security widget and Vulnerability
+    Report on GitLab Ultimate. Policy-suppressed findings are left out (the schema has no suppression)."""
+    results = [results] if isinstance(results, dict) else results
+    base = base or Path.cwd()
+    vulnerabilities = []
+    for result, f in _reportable(results):
+        location = {"file": _artifact_uri(result["skill"]["path"], f.get("file"), base)}
+        if f.get("line") and "!/" not in (f.get("file") or ""):
+            location["start_line"] = f["line"]
+        vulnerabilities.append({
+            "id": str(uuid.UUID(_fingerprint(result, f)[:32])),
+            "name": _ci_text(result, f)[:255],
+            "description": f"{f['why']}\n\nSkill: {result['skill']['name']} (verdict {result['verdict']}). "
+                           f"Source: {SOURCE_LABEL.get(f['source'], f['source'])}."
+                           + (f"\n\nEvidence: {f['evidence'][:400]}" if f.get("evidence") else ""),
+            "severity": f["severity"].capitalize() if f["severity"] in SARIF_LEVEL else "Unknown",
+            "solution": f["fix"] or None,
+            "identifiers": [
+                {"type": "skillguard_rule", "name": f"SkillGuard {f['rule']}", "value": f["rule"]},
+                {"type": "owasp_ast", "name": f"OWASP {f['ast']} {AST_NAMES.get(f['ast'], '')}".strip(),
+                 "value": f["ast"], "url": "https://github.com/OWASP/www-project-agentic-skills-top-10"},
+            ],
+            "location": location,
+        })
+        if vulnerabilities[-1]["solution"] is None:
+            del vulnerabilities[-1]["solution"]
+    stamp = "%Y-%m-%dT%H:%M:%S"
+    tool = {"id": "skillguard", "name": "SkillGuard", "version": __version__, "vendor": {"name": "SkillGuard"}}
+    return {
+        "version": GITLAB_SAST_VERSION,
+        "scan": {
+            "analyzer": tool, "scanner": tool, "type": "sast",
+            "start_time": time.strftime(stamp, time.gmtime(started or time.time())),
+            "end_time": time.strftime(stamp, time.gmtime()),
+            # "failure" only when no skill could be scanned; per-skill verdicts are in the findings.
+            "status": "success" if results else "failure",
+        },
+        "vulnerabilities": vulnerabilities,
+    }
+
+
 def to_sarif(results: dict | list[dict], base: Path | None = None) -> dict:
     """SARIF 2.1.0 for one or more scan results; URIs are relative to `base` (default: current directory)."""
     results = [results] if isinstance(results, dict) else results
@@ -217,7 +303,6 @@ def to_sarif(results: dict | list[dict], base: Path | None = None) -> dict:
             location = {"artifactLocation": {"uri": uri}}
             if region:
                 location["region"] = region
-            identity = f"{result['skill']['name']}|{f['rule']}|{f.get('file')}|{f.get('evidence', '')[:200]}"
             entry = {
                 "ruleId": rule_id,
                 "level": SARIF_LEVEL.get(f["severity"], "warning"),
@@ -225,7 +310,7 @@ def to_sarif(results: dict | list[dict], base: Path | None = None) -> dict:
                                     + (f" ({f['file']})" if "!/" in (f.get("file") or "") else "")
                                     + f". {f['why']} Fix: {f['fix']}".rstrip()},
                 "locations": [{"physicalLocation": location}],
-                "partialFingerprints": {"skillguard/v1": hashlib.sha256(identity.encode()).hexdigest()},
+                "partialFingerprints": {"skillguard/v1": _fingerprint(result, f)},
                 "properties": {"severity": f["severity"], "source": f["source"], "status": f["status"],
                                "skill": result["skill"]["name"], "verdict": result["verdict"]},
             }

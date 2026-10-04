@@ -2,7 +2,7 @@
 
 A low-cost, pre-install security scanner for agent skills (Claude Code, Codex, Cursor and similar). It should catch most real security problems and explain each one clearly to the person deciding whether to install the skill.
 
-Status: v1.4: enterprise use: result cache, review-call cap, bundled-archive inspection, .zip/.skill input, multi-skill scans, policy file, hardened reports, SARIF for code scanning, packaging, GitHub Action, Docker (D22–D28, section 15); v1.3 = SKILLGUARD_* configuration and the LiteLLM backend (D21); v1.2 = token accounting and single-model operation (D20); v1.1 = fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-10-04.
+Status: v1.4: enterprise use: result cache, review-call cap, bundled-archive inspection, .zip/.skill input, multi-skill scans, policy file, hardened reports, GitLab Code Quality + SAST reports and CI template, SARIF for GitHub, packaging, GitHub Action, Docker (D22–D29, section 15); v1.3 = SKILLGUARD_* configuration and the LiteLLM backend (D21); v1.2 = token accounting and single-model operation (D20); v1.1 = fixes from an external code review (section 14). Evaluated on 19 benign skills + 8 malicious samples (section 13). Last updated 2026-10-04.
 
 Usage:
 ```bash
@@ -122,6 +122,7 @@ skill folder / zip / git URL
 | D26 | *(v1.4)* **Policy file: suppressions and approvals with a required reason, optional expiry and sha256 pins; approvals pin the whole content hash and never override BLOCK; loaded only from an explicit path** | Organisations need to record reviewed decisions instead of disabling checks. Pinning to hashes means an exception lapses when the reviewed content changes (OWASP AST07 update drift); expiry forces re-review (AST09). Auto-discovering a policy next to a skill would let a skill exempt itself. | Disabling rules globally; inline suppression comments in skills (author-controlled). |
 | D27 | *(v1.4)* **Escape all untrusted text in Markdown reports** (skill content, Cisco output, LLM answers); fences longer than any backtick run inside | Reports are posted as PR comments and job summaries. Before, a skill could close the evidence fence and inject a fake "✅ SAFE" heading, links, images (tracking) or HTML. | Trusting scanner output. |
 | D28 | *(v1.4)* **Distribution: pip package with a `skillguard` command, a composite GitHub Action, a non-root Docker image with the pinned Cisco scanner pre-fetched (`UV_OFFLINE=1`)** | CI integration is how scanning becomes routine. The image makes the static layers work air-gapped (verified with `--network none`). Action inputs reach the shell only via environment variables (no script injection). | — |
+| D29 | *(v1.4)* **GitLab support: Code Quality and SAST (schema 15.2.1) reports plus an includable CI template; REVIEW = allowed failure (exit code 1), BLOCK and errors fail the job** | GitLab does not read SARIF. Code Quality works on every tier and puts findings in the merge request; the SAST report adds the security widget and Vulnerability Report on Ultimate. Allowed failure gives REVIEW a visible "warning" state without blocking merges by default. Policy-suppressed findings are left out of both (neither format has suppressions). | SARIF only; a custom MR-comment bot (needs an API token). |
 | D19 | *(v1.1)* **Validate every external output strictly**: Cisco (exit code, report shape, severities), Jev (choice, all three probabilities finite and summing to ~1), LLM (finish reason, all required fields, the full evidence quote at the cited line) | Malformed or truncated answers were accepted and could downgrade real findings or produce SAFE. | Best-effort parsing (v1). |
 
 ---
@@ -313,11 +314,11 @@ Goal: make SkillGuard routine to run across an organisation's skills, while keep
 | No blind spots in packaged content | Bundled archives inspected in memory (D24): a credential-exfiltration instruction inside a `.tar.gz` now BLOCKs instead of stopping at REVIEW. `.zip`/`.skill` packages scanned directly (D25). |
 | Many skills per run | `scan` takes several paths and finds every `SKILL.md` folder at any depth (not inside another skill, not in `.git`/`node_modules`); one summary, per-skill reports (`--out`), worst-verdict exit code; one broken skill is reported as an error without hiding the others. |
 | Governance and audit | Policy file (D26); `skillguard approve` prints an approval pinned to the current content; reports carry `content_sha256`, the SkillGuard version, cache and policy details. |
-| CI integration | SARIF 2.1.0 with rule metadata, `security-severity`, paths relative to the repository, stable `partialFingerprints`, native `suppressions`; GitHub Action with `fail-on`, job summary, cache (D28). |
+| CI integration | GitLab: Code Quality + SAST reports and a CI template (D29), validated against GitLab's CI and SAST schemas and run in the job image. GitHub: SARIF 2.1.0 with rule metadata, `security-severity`, paths relative to the repository, stable `partialFingerprints`, native `suppressions`; GitHub Action with `fail-on`, job summary, cache (D28). |
 | Safe output | Markdown escaping of untrusted text (D27). |
 | Distribution | `pyproject.toml` (`pip install`, `skillguard` command, `[litellm]` extra), Docker image (non-root, offline static layers), CI workflow testing Python 3.11–3.13, the Action and the image. |
 
-Tests: 81 (no network), including archive bombs/links/traversal/duplicates, policy hash pins and expiry, cache hits and invalidation, the call cap, report injection and SARIF.
+Tests: 82 (no network), including archive bombs/links/traversal/duplicates, policy hash pins and expiry, cache hits and invalidation, the call cap, report injection and SARIF.
 
 Next steps (not done): sign and publish the image and package; a SkillSpector second engine if evaluation shows recall gaps; a larger labeled test set (section 13).
 

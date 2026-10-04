@@ -18,7 +18,7 @@ If any layer fails, the verdict becomes at least REVIEW, never a silent SAFE. Se
 Built for use across an organisation:
 
 - **Cheap at scale.** Results are cached by content hash, so an unchanged skill is never paid for twice (CI re-runs cost $0). A per-skill cap on LLM calls stops one huge skill from running up the bill.
-- **CI gate.** A GitHub Action, SARIF for GitHub code scanning, a summary across many skills, and exit codes for the worst verdict.
+- **CI gate.** A GitLab CI template with Code Quality and SAST reports for merge requests. Also a GitHub Action with SARIF, a summary across many skills, and exit codes for the worst verdict.
 - **Governance.** A policy file with reviewed suppressions and approvals. Each entry has a reason and an expiry, and can be pinned to a hash, so it lapses when the content changes. Every report records the skill's content hash.
 - **Air-gapped / private.** A Docker image with the pinned Cisco scanner pre-fetched; a local model via LiteLLM + Ollama; or static checks only.
 
@@ -120,6 +120,33 @@ Bundled zip and tar archives are opened in memory, and their text files are revi
 
 `tools/jev_filter.py` filters false positives out of a SkillSpector or Cisco JSON report using Jev, with the same decision policy as SkillGuard.
 
+## CI: GitLab
+
+Include the template in `.gitlab-ci.yml` and set `SKILLGUARD_API_KEY` as a masked CI/CD variable:
+
+```yaml
+include:
+  - remote: https://raw.githubusercontent.com/koshkarov/skillguard/main/ci/skillguard.gitlab-ci.yml
+  # from a GitLab mirror instead:  - project: my-group/skillguard
+  #                                  file: ci/skillguard.gitlab-ci.yml
+variables:
+  SKILLGUARD_PATHS: "skills .claude/skills"   # folders searched for skills, or packages
+  SKILLGUARD_POLICY: "skillguard-policy.toml"
+```
+
+| Verdict | Job | Where findings show |
+|---|---|---|
+| ✅ SAFE | passed | Code Quality widget in the merge request (all tiers) |
+| ⚠️ REVIEW | passed with warning (allowed failure, exit code 1) | Security widget and Vulnerability Report (Ultimate) |
+| ⛔ BLOCK / error | failed | Markdown report linked from the merge request ("SkillGuard report") |
+
+- **Strict gate:** to make REVIEW block merges too, override the job with `allow_failure: false`.
+- **Cost:** results are kept in the GitLab cache between pipelines, so a merge request pays only for the skills it changes.
+- **Pinning:** set `SKILLGUARD_PACKAGE` to a tag or commit tarball, or `SKILLGUARD_IMAGE` to an image built from the Dockerfile (no install step).
+- **Protected variables:** if `SKILLGUARD_API_KEY` is *protected*, merge request pipelines from unprotected branches don't receive it. The LLM review can't run there, and every skill is at most REVIEW.
+
+The reports can also be written directly, for any CI: `--codequality gl-code-quality-report.json --gitlab-sast gl-sast-report.json`. The SAST report is validated against GitLab's schema 15.2.1.
+
 ## CI: GitHub Action
 
 ```yaml
@@ -136,7 +163,7 @@ Bundled zip and tar archives are opened in memory, and their text files are revi
 
 The Action writes the report to the job summary, sets the `verdict` output, and caches results between runs, so a pull request that changes one skill pays only for that skill. A complete workflow is in [`examples/github-workflow.yml`](examples/github-workflow.yml). In SARIF, file paths are relative to the working directory, so GitHub links findings to the right files. Findings suppressed by policy are uploaded as suppressed.
 
-Other CI systems: run `skillguard scan ... --sarif out.sarif` and gate on the exit code.
+Other CI systems: run `skillguard scan ... --sarif out.sarif` (or the GitLab report flags) and gate on the exit code.
 
 ## Policy: suppressions and approvals
 
@@ -159,7 +186,7 @@ reason = "Reviewed by security, SEC-1250"
 - Suppressed findings stay in the report, marked as suppressed, and don't count towards the verdict.
 - An approval turns REVIEW into SAFE only while the skill's content hash matches. It never overrides BLOCK.
 - Expired, unmatched or outdated entries are reported in the output.
-- SkillGuard loads a policy only from an explicit path (`--policy` / `SKILLGUARD_POLICY`), never from inside a scanned skill. Protect the file with CODEOWNERS so a pull request can't exempt its own skill.
+- SkillGuard loads a policy only from an explicit path (`--policy` / `SKILLGUARD_POLICY`), never from inside a scanned skill. Require security-team approval for changes to the file (CODEOWNERS on GitHub or GitLab Premium, or a protected branch), so a merge request can't exempt its own skill.
 
 ## Cost controls
 

@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -65,6 +66,7 @@ def _error_result(path: Path, message: str) -> dict:
 
 
 def cmd_scan(args) -> int:
+    started = time.time()
     paths = [Path(p) for p in args.path]
     missing = [p for p in paths if not p.exists()]
     if missing:
@@ -113,6 +115,10 @@ def cmd_scan(args) -> int:
         Path(args.json).write_text(json.dumps(document, indent=2))
     if args.sarif:
         Path(args.sarif).write_text(json.dumps(report.to_sarif(scanned), indent=2))
+    if args.codequality:
+        Path(args.codequality).write_text(json.dumps(report.to_codequality(scanned), indent=2))
+    if args.gitlab_sast:
+        Path(args.gitlab_sast).write_text(json.dumps(report.to_gitlab_sast(scanned, started=started), indent=2))
     if args.out:
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
@@ -121,7 +127,7 @@ def cmd_scan(args) -> int:
                 (out / f"{_stem(path)}.md").write_text(report.to_markdown(r))
                 (out / f"{_stem(path)}.json").write_text(json.dumps(r, indent=2))
         (out / "SUMMARY.md").write_text(report.summary_markdown(scanned))
-    if not (args.md or args.json or args.sarif or args.out):
+    if not (args.md or args.json or args.sarif or args.codequality or args.gitlab_sast or args.out):
         print(markdown)
     else:
         for r in scanned:
@@ -259,6 +265,8 @@ def main() -> int:
             p.add_argument("--md", help="Markdown report (a summary plus every skill's report)")
             p.add_argument("--json", help="JSON result (one skill: its result; several: {verdict, skills})")
             p.add_argument("--sarif", help="SARIF 2.1.0 for GitHub code scanning; paths relative to the current dir")
+            p.add_argument("--codequality", help="GitLab Code Quality report (merge request widget, all tiers)")
+            p.add_argument("--gitlab-sast", help="GitLab SAST report (security widget, GitLab Ultimate)")
             p.add_argument("--out", help="directory for one Markdown + JSON report per skill and SUMMARY.md")
             p.add_argument("--policy", help="policy file with suppressions and approvals (SKILLGUARD_POLICY)")
             p.add_argument("--no-cache", action="store_true", help="ignore and do not update the result cache")

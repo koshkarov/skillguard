@@ -1,0 +1,52 @@
+# SkillGuard for GitLab CI. Include it in .gitlab-ci.yml:
+#
+#   include:
+#     - remote: https://raw.githubusercontent.com/koshkarov/skillguard/main/ci/skillguard.gitlab-ci.yml
+#     # or, from a GitLab mirror:  - project: my-group/skillguard
+#     #                              file: ci/skillguard.gitlab-ci.yml
+#   variables:
+#     SKILLGUARD_PATHS: "skills .claude/skills"
+#
+# Settings: SKILLGUARD_API_KEY as a *masked* CI/CD variable. If it is also *protected*, merge request
+# pipelines from unprotected branches do not receive it, the LLM review cannot run, and every skill is
+# at most REVIEW. Any SKILLGUARD_* setting (model, backend, policy, ...) can be set as a variable.
+#
+# Results: findings in the merge request's Code Quality widget (all tiers) and Security widget /
+# Vulnerability Report (Ultimate), the Markdown report linked from the merge request, and the job status:
+#   SAFE -> passed · REVIEW -> passed with warning (allowed failure) · BLOCK or error -> failed.
+# For a strict gate, override the job with `allow_failure: false`.
+
+variables:
+  SKILLGUARD_PATHS: "."              # skill folders, .zip/.skill packages, or folders searched for skills
+  SKILLGUARD_ARGS: ""                # extra flags, e.g. "--no-llm --no-triage" for a free static-only scan
+  SKILLGUARD_IMAGE: "python:3.12-slim"   # or an image built from the SkillGuard Dockerfile (no install step)
+  # pip requirement; a tarball URL needs no git in the image. Pin a tag or commit in production.
+  SKILLGUARD_PACKAGE: "https://github.com/koshkarov/skillguard/archive/refs/heads/main.tar.gz"
+
+skillguard:
+  stage: test
+  image: $SKILLGUARD_IMAGE
+  variables:
+    SKILLGUARD_CACHE_DIR: "$CI_PROJECT_DIR/.skillguard-cache"   # unchanged skills are not paid for twice
+    UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"                   # Cisco scanner download, reused
+    PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  cache:
+    key: skillguard-$CI_DEFAULT_BRANCH
+    paths: [.skillguard-cache/, .uv-cache/]
+    when: always
+  before_script:
+    - command -v skillguard > /dev/null || pip install --quiet uv "$SKILLGUARD_PACKAGE"
+  script:
+    # SKILLGUARD_PATHS and SKILLGUARD_ARGS are split into words on purpose.
+    - skillguard scan $SKILLGUARD_PATHS $SKILLGUARD_ARGS
+        --md skillguard-report.md --json skillguard-report.json
+        --codequality gl-code-quality-report.json --gitlab-sast gl-sast-report.json
+  allow_failure:
+    exit_codes: [1]                  # REVIEW: warn, do not block the merge
+  artifacts:
+    when: always
+    expose_as: SkillGuard report
+    paths: [skillguard-report.md, skillguard-report.json]
+    reports:
+      codequality: gl-code-quality-report.json
+      sast: gl-sast-report.json

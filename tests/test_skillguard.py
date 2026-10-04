@@ -506,6 +506,25 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(all(r["partialFingerprints"]["skillguard/v1"] for r in run["results"]))
 
 
+    def test_gitlab_reports(self):
+        root = make_skill({"SKILL.md": MANIFEST})
+        result = self.hostile_result(root)
+        member = Finding("check", "PIPE_TO_SHELL", "AST02", "CRITICAL", "pipe", "a.tar.gz!/x.sh", 7)
+        hidden = Finding("check", "X", "AST01", "HIGH", "x", "SKILL.md", 1, status="suppressed")
+        result["findings"] += [member.to_dict(), hidden.to_dict()]
+        quality = report.to_codequality(result, base=root.parent)
+        self.assertEqual([(q["severity"], q["location"]["path"], q["location"]["lines"]["begin"]) for q in quality],
+                         [("critical", f"{root.name}/SKILL.md", 3), ("blocker", f"{root.name}/a.tar.gz", 1)])
+        self.assertEqual(len({q["fingerprint"] for q in quality}), 2)
+        sast = report.to_gitlab_sast(result, base=root.parent)
+        self.assertEqual((sast["version"], sast["scan"]["type"], sast["scan"]["status"]), ("15.2.1", "sast", "success"))
+        vulns = sast["vulnerabilities"]
+        self.assertEqual([v["severity"] for v in vulns], ["High", "Critical"])  # suppressed one left out
+        self.assertEqual(vulns[1]["location"], {"file": f"{root.name}/a.tar.gz"})
+        self.assertTrue(all(v["id"] and v["identifiers"] for v in vulns))
+        self.assertEqual(sast["vulnerabilities"][0]["id"], report.to_gitlab_sast(result, base=root.parent)["vulnerabilities"][0]["id"])
+
+
 # --- Archives and packages -----------------------------------------------------------------------
 
 def tar_gz(members: dict[str, bytes]) -> bytes:
