@@ -1,0 +1,29 @@
+# SkillGuard policy: reviewed exceptions, kept under version control and protected with CODEOWNERS
+# (for example `/skillguard-policy.toml @your-org/security`), so a pull request cannot exempt its own skill.
+# Use it with:  skillguard scan skills/ --policy skillguard-policy.toml   (or SKILLGUARD_POLICY=...)
+#
+# Suppressed findings still appear in every report (as "suppressed by policy") and in SARIF as
+# suppressed results; they no longer count towards the verdict. Expired entries are ignored and reported.
+
+# A bundled binary that a person inspected. Pinned to its hash: if the file changes, the finding returns.
+[[suppress]]
+rule = "COVERAGE_GAP"
+skill = "web-artifacts-builder"
+path = "scripts/tool.bin"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+reason = "Vendor binary verified against upstream release v2.3.1 (SEC-1234, J. Doe)"
+expires = 2027-03-31
+
+# A rule that is noise for one skill. Prefer narrow entries (skill + path) over broad ones.
+[[suppress]]
+rule = "UNPINNED_DEPENDENCIES"
+skill = "internal-*"
+reason = "Internal skills install from our pinned mirror"
+
+# Accept a REVIEW verdict after a human review of exactly this content (never overrides BLOCK).
+# Generate the entry with:  skillguard approve path/to/skill --reason "..." --expires 2027-03-31
+[[approve]]
+skill = "canvas-design"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+reason = "Persona instructions reviewed, no harmful behaviour (SEC-1250, A. Smith)"
+expires = 2027-03-31

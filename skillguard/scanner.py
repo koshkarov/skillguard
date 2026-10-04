@@ -6,9 +6,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import config, layer1, semantic, triage
+from . import __version__, cache, config, layer1, policy as policy_mod, semantic, triage
 from .model import Finding, LayerStatus, severity_rank
-from .skill import load_skill
+from .skill import Skill, open_skill
 
 BLOCK_CATEGORIES = {"AST01", "AST03"}
 
@@ -28,7 +28,7 @@ def _confirmed(finding: Finding) -> bool:
 
 def verdict(findings: list[Finding], review: dict, layers: list[LayerStatus]) -> tuple[str, str]:
     """BLOCK and REVIEW conditions first; SAFE only for a complete scan with nothing high left."""
-    active = [f for f in findings if f.status != "removed"]
+    active = [f for f in findings if f.status not in ("removed", "suppressed")]
     high = [f for f in active if severity_rank(f.severity) >= severity_rank("HIGH")]
     blocking = [f for f in high if _confirmed(f) and f.ast in BLOCK_CATEGORIES]
     gaps = [f for f in active if f.rule == "COVERAGE_GAP"]
@@ -75,18 +75,9 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
     return unique
 
 
-def scan(path: Path, *, model: str | None = None, use_llm: bool | None = None, use_triage: bool | None = None,
-         use_cisco: bool | None = None, triage_model: str | None = None) -> dict:
-    """Scan one skill. Arguments left as None come from the active settings (SKILLGUARD_* variables).
-    The triage model defaults to the review model, so a single model is enough."""
-    started = time.monotonic()
-    s = config.settings
-    model = model or s.model
-    triage_model = triage_model or s.triage_model or model
-    use_llm = s.use_llm if use_llm is None else use_llm
-    use_triage = s.use_triage if use_triage is None else use_triage
-    use_cisco = s.use_cisco if use_cisco is None else use_cisco
-    skill = load_skill(path)
+def analyze(skill: Skill, *, model: str, triage_model: str, use_llm: bool, use_triage: bool,
+            use_cisco: bool) -> tuple[list[Finding], list[LayerStatus], dict]:
+    """Run the layers on a loaded skill. Returns (findings, layer statuses, LLM review)."""
     layers: list[LayerStatus] = []
     findings: list[Finding] = []
 
@@ -122,21 +113,70 @@ def scan(path: Path, *, model: str | None = None, use_llm: bool | None = None, u
         layers.append(semantic_status)
     else:
         layers.append(LayerStatus("semantic", True, "disabled (SKILLGUARD_LLM=false / --no-llm)", skipped=True))
+    return findings, layers, review
+
+
+def scan(path: Path, *, model: str | None = None, use_llm: bool | None = None, use_triage: bool | None = None,
+         use_cisco: bool | None = None, triage_model: str | None = None, use_cache: bool = True,
+         policy: policy_mod.Policy | None = None) -> dict:
+    """Scan one skill directory or .zip/.skill package. Arguments left as None come from the active settings
+    (SKILLGUARD_* variables). The triage model defaults to the review model, so a single model is enough.
+
+    Results of complete scans are cached by content hash (SKILLGUARD_CACHE_DIR); the policy (suppressions,
+    approvals) is applied afterwards, so it is never baked into the cache."""
+    started = time.monotonic()
+    s = config.settings
+    options = {
+        "model": model or s.model,
+        "triage_model": triage_model or s.triage_model or model or s.model,
+        "use_llm": s.use_llm if use_llm is None else use_llm,
+        "use_triage": s.use_triage if use_triage is None else use_triage,
+        "use_cisco": s.use_cisco if use_cisco is None else use_cisco,
+    }
+    policy = policy if policy is not None else policy_mod.load(s.policy)
+    with open_skill(Path(path)) as skill:
+        content_sha256 = skill.content_sha256
+        cache_key = cache.key(content_sha256, cache.fingerprint(**options))
+        cached = cache.get(cache_key) if use_cache else None
+        if cached:
+            findings = [Finding(**f) for f in cached["findings"]]
+            layers = [LayerStatus(**layer) for layer in cached["layers"]]
+            review = cached["review"]
+        else:
+            findings, layers, review = analyze(skill, **options)
+            if use_cache and all(layer.ok or layer.skipped for layer in layers):
+                cache.put(cache_key, {"findings": [f.to_dict() for f in findings], "layers": [vars(l) for l in layers],
+                                      "review": review, "scanned_at": _now()})
+        applied = policy_mod.apply(policy, skill.name, content_sha256, skill.hashes, findings)
+        summary = {"name": skill.name, "path": skill.display, "description": skill.description,
+                   "files": len(skill.files) + len(skill.binary_files), "coverage_gaps": skill.coverage_gaps,
+                   "content_sha256": content_sha256}
 
     findings.sort(key=lambda f: (f.status != "active", -severity_rank(f.severity), f.ast, f.location))
     label, reason = verdict(findings, review, layers)
+    unapproved = label
+    if label == "REVIEW" and applied["approval"]:
+        label, reason = "SAFE", f"Approved by policy after human review ({applied['approval']['reason']}); was: {reason}"
+    spent = not cached
     return {
-        "skill": {"name": skill.name, "path": str(skill.root), "description": skill.description,
-                  "files": len(skill.files) + len(skill.binary_files), "coverage_gaps": skill.coverage_gaps},
+        "skillguard_version": __version__,
+        "skill": summary,
         "verdict": label,
         "reason": reason,
+        "verdict_before_policy": unapproved,
         "review": review,
         "findings": [f.to_dict() for f in findings],
         "layers": [vars(layer) for layer in layers],
-        "cost": round(sum(layer.cost for layer in layers), 6),
-        "tokens_in": sum(layer.tokens_in for layer in layers),
-        "tokens_out": sum(layer.tokens_out for layer in layers),
-        "config": {"backend": s.backend, "model": model, "triage_model": triage_model},
+        "cost": round(sum(layer.cost for layer in layers), 6) if spent else 0.0,
+        "tokens_in": sum(layer.tokens_in for layer in layers) if spent else 0,
+        "tokens_out": sum(layer.tokens_out for layer in layers) if spent else 0,
+        "cache": {"hit": True, "scanned_at": cached["scanned_at"]} if cached else {"hit": False},
+        "policy": applied,
+        "config": {"backend": s.backend, **options},
         "seconds": round(time.monotonic() - started, 2),
-        "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        "scanned_at": _now(),
     }
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())

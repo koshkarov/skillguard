@@ -15,9 +15,27 @@ SkillGuard never executes skill code.
 
 If any layer fails, the verdict becomes at least REVIEW, never a silent SAFE. See [DESIGN.md](DESIGN.md) for the reasoning, the decisions and the evaluation results.
 
+Built for use across an organisation:
+
+- **Cheap at scale.** Results are cached by content hash, so an unchanged skill is never paid for twice (CI re-runs cost $0). A per-skill cap on LLM calls stops one huge skill from running up the bill.
+- **CI gate.** A GitHub Action, SARIF for GitHub code scanning, a summary across many skills, and exit codes for the worst verdict.
+- **Governance.** A policy file with reviewed suppressions and approvals. Each entry has a reason and an expiry, and can be pinned to a hash, so it lapses when the content changes. Every report records the skill's content hash.
+- **Air-gapped / private.** A Docker image with the pinned Cisco scanner pre-fetched; a local model via LiteLLM + Ollama; or static checks only.
+
+## Install
+
+```bash
+pip install "git+https://github.com/koshkarov/skillguard"            # adds the `skillguard` command
+pip install "skillguard[litellm] @ git+https://github.com/koshkarov/skillguard"   # with the LiteLLM backend
+uvx --from "git+https://github.com/koshkarov/skillguard" skillguard scan path/to/skill   # no install
+docker build -t skillguard .                                         # image; see "Docker" below
+```
+
+`python3 -m skillguard` works from a checkout as well.
+
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+ (standard library only)
 - [`uv`](https://docs.astral.sh/uv/). The Cisco scanner is run with `uvx`, so there's no separate install.
 - For layers 2 and 3, one of:
   - an [OpenRouter](https://openrouter.ai) API key (default backend, no extra packages), or
@@ -42,6 +60,10 @@ The main ones:
 | `SKILLGUARD_TRIAGE_MODEL` | same as model | triage model; `typesafe/jev-1.13` for Jev |
 | `SKILLGUARD_BASE_URL` | OpenRouter | any OpenAI-compatible endpoint, or LiteLLM `api_base` |
 | `SKILLGUARD_LLM` / `_TRIAGE` / `_CISCO` | `true` | turn layers on or off |
+| `SKILLGUARD_CACHE_DIR` | `~/.cache/skillguard` | result cache; `none` disables |
+| `SKILLGUARD_CACHE_TTL_DAYS` | `30` | re-scan cached results older than this |
+| `SKILLGUARD_MAX_REVIEW_CALLS` | `8` | cost cap: larger skills are not sent to the LLM (verdict at least REVIEW) |
+| `SKILLGUARD_POLICY` | — | policy file with suppressions and approvals |
 
 Examples:
 
@@ -72,30 +94,88 @@ Without installing `litellm`, run the LiteLLM backend with `uv run --no-project 
 ## Usage
 
 ```bash
-# Scan one skill
-python3 -m skillguard scan path/to/skill --md report.md --json report.json --sarif report.sarif
+# Scan one skill (a folder, or a .zip/.skill package)
+skillguard scan path/to/skill --md report.md --json report.json --sarif report.sarif
+
+# Scan every skill in a repository (folders with SKILL.md at any depth), one report per skill plus a summary
+skillguard scan . --out skillguard-reports/ --sarif skillguard.sarif
 
 # Static checks only (free, no API key). A partial scan: it can BLOCK or REVIEW, never SAFE
-python3 -m skillguard scan path/to/skill --no-llm --no-triage
+skillguard scan path/to/skill --no-llm --no-triage
 
-# Evaluate against labeled sets
-python3 -m skillguard eval --benign path/to/benign-skills --malicious path/to/malicious-skills --out eval/
+# Evaluate against labeled sets (no cache, no policy)
+skillguard eval --benign path/to/benign-skills --malicious path/to/malicious-skills --out eval/
 
 # Tests (no network)
 python3 -m unittest discover -s tests
 ```
 
-Exit codes: `0` SAFE, `1` REVIEW, `2` BLOCK, `3` error (path not scannable, no verdict), so the scanner can gate CI.
+Exit codes: `0` SAFE, `1` REVIEW, `2` BLOCK, `3` error (path not scannable, invalid configuration or policy; no verdict). With several skills, the exit code is the worst one, so the scanner can gate CI.
 
-Exit code `3` also covers an invalid configuration.
-
-CLI flags, each overriding its `SKILLGUARD_*` variable: `--env-file`, `--backend`, `--model`, `--triage-model`, `--fallback-model`, `--no-llm`, `--no-triage`, `--no-cisco`, and for `eval`, `--workers`.
+CLI flags, each overriding its `SKILLGUARD_*` variable: `--env-file`, `--backend`, `--model`, `--triage-model`, `--fallback-model`, `--no-llm`, `--no-triage`, `--no-cisco`, `--policy`, `--workers`; for `scan` also `--no-cache`, `--out`.
 
 Every scan reports input/output tokens and cost per layer and in total, and `eval` adds a per-skill token table with totals. Costs are what the provider reports: OpenRouter's billed amount, or LiteLLM's cost calculation. With OpenAI models they run slightly above list price because prompt-cache writes cost 1.25× the input price.
 
-Anything SkillGuard cannot inspect (symlinks, unknown binaries or archives, files over 2 MB, missing `SKILL.md`) is reported as a coverage gap and forces at least REVIEW.
+Bundled zip and tar archives are opened in memory, and their text files are reviewed like any other file (shown as `archive.tar.gz!/path`). Anything SkillGuard cannot inspect is reported as a coverage gap and forces at least REVIEW: symlinks, unknown binaries, other archive types, encrypted or nested archives, files over 2 MB, unsafe or duplicate paths in a package, and a missing `SKILL.md`.
 
 `tools/jev_filter.py` filters false positives out of a SkillSpector or Cisco JSON report using Jev, with the same decision policy as SkillGuard.
+
+## CI: GitHub Action
+
+```yaml
+- uses: koshkarov/skillguard@main        # pin a tag or commit SHA in production
+  with:
+    paths: skills .claude/skills         # folders searched for skills, or packages
+    api-key: ${{ secrets.SKILLGUARD_API_KEY }}
+    policy: skillguard-policy.toml
+    fail-on: block                       # or 'review', or 'never'
+- uses: github/codeql-action/upload-sarif@v3
+  if: always()
+  with: { sarif_file: skillguard.sarif, category: skillguard }
+```
+
+The Action writes the report to the job summary, sets the `verdict` output, and caches results between runs, so a pull request that changes one skill pays only for that skill. A complete workflow is in [`examples/github-workflow.yml`](examples/github-workflow.yml). In SARIF, file paths are relative to the working directory, so GitHub links findings to the right files. Findings suppressed by policy are uploaded as suppressed.
+
+Other CI systems: run `skillguard scan ... --sarif out.sarif` and gate on the exit code.
+
+## Policy: suppressions and approvals
+
+After a person reviews a finding, record the decision in a TOML policy file instead of switching checks off. See [`examples/skillguard-policy.toml`](examples/skillguard-policy.toml):
+
+```toml
+[[suppress]]                     # one reviewed finding
+rule = "COVERAGE_GAP"
+path = "scripts/tool.bin"
+sha256 = "…"                     # only while the file is unchanged
+reason = "Vendor binary verified, SEC-1234"
+expires = 2027-03-31
+
+[[approve]]                      # accept a REVIEW verdict for exactly this content
+skill = "canvas-design"
+sha256 = "…"                     # from `skillguard approve <path> --reason ...`
+reason = "Reviewed by security, SEC-1250"
+```
+
+- Suppressed findings stay in the report, marked as suppressed, and don't count towards the verdict.
+- An approval turns REVIEW into SAFE only while the skill's content hash matches. It never overrides BLOCK.
+- Expired, unmatched or outdated entries are reported in the output.
+- SkillGuard loads a policy only from an explicit path (`--policy` / `SKILLGUARD_POLICY`), never from inside a scanned skill. Protect the file with CODEOWNERS so a pull request can't exempt its own skill.
+
+## Cost controls
+
+- **Cache.** A complete scan is stored under the skill's content hash plus every setting that affects the result. A cache hit costs nothing and takes milliseconds. Failed or partial-failure scans are never cached. The policy is applied after the cache, so editing it needs no re-scan. Treat the cache directory like the installation itself: a writable cache is trusted.
+- **Cap.** `SKILLGUARD_MAX_REVIEW_CALLS` (default 8) limits LLM review calls per skill. A larger skill is reported as not reviewed (REVIEW) instead of being sent anyway.
+- **Free tier.** `--no-llm --no-triage` runs only the deterministic layers.
+
+## Docker (air-gapped)
+
+```bash
+docker build -t skillguard .
+docker run --rm --network none -v "$PWD:/work" -v skillguard-cache:/home/skillguard/.cache/skillguard \
+  skillguard scan skills/ --no-llm --no-triage --sarif skillguard.sarif
+```
+
+The image runs as a non-root user and contains the pinned Cisco scanner, so the static layers work with no network access. For the LLM layers, build with `--build-arg EXTRAS=litellm` and point `SKILLGUARD_BASE_URL` at an internal model endpoint.
 
 ## Results so far
 
@@ -109,4 +189,4 @@ This is a small evaluation, and two rules were written after seeing these sample
 
 ## Privacy
 
-Layers 2 and 3 send skill content to the configured model provider. For private skills, use a local model (LiteLLM + Ollama, above) or `--no-llm --no-triage`.
+Layers 2 and 3 send skill content to the configured model provider. For private skills, use a local model (LiteLLM + Ollama, above) or `--no-llm --no-triage`. Reports escape all text taken from skills and model answers, so a report posted as a PR comment cannot carry injected links, images or HTML.

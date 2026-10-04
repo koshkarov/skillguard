@@ -60,6 +60,9 @@ SETTINGS: dict[str, Setting] = {
     "review_max_tokens": Setting("SKILLGUARD_REVIEW_MAX_TOKENS", int, 8000, "Max output tokens per review call"),
     "max_prompt_chars": Setting("SKILLGUARD_MAX_PROMPT_CHARS", int, 400_000,
                                 "Max characters per review prompt; larger skills are split into several calls"),
+    "max_review_calls": Setting("SKILLGUARD_MAX_REVIEW_CALLS", int, 8,
+                                "Cost cap: a skill needing more review calls than this is not sent to the LLM "
+                                "(the review is marked failed, so the verdict is at least REVIEW)"),
     # --- Jev (optional triage model) ----------------------------------------------------------------
     "jev_base_url": Setting("SKILLGUARD_JEV_BASE_URL", str, OPENROUTER_URL, "Endpoint for TypeSafe Jev"),
     "jev_api_key": Setting("SKILLGUARD_JEV_API_KEY", str, "",
@@ -76,6 +79,14 @@ SETTINGS: dict[str, Setting] = {
                               "P(true_positive) at or above this always keeps a finding"),
     "drop_threshold": Setting("SKILLGUARD_DROP_THRESHOLD", float, 0.6,
                               "P(false_positive) at or above this removes a finding"),
+    # --- Cache and policy ----------------------------------------------------------------------------
+    "cache_dir": Setting("SKILLGUARD_CACHE_DIR", str, "",
+                         "Result cache keyed by skill content + settings, so unchanged skills are not paid for "
+                         "twice. Empty = $XDG_CACHE_HOME/skillguard or ~/.cache/skillguard; 'none' disables"),
+    "cache_ttl_days": Setting("SKILLGUARD_CACHE_TTL_DAYS", float, 30.0,
+                              "Cached results older than this are re-scanned"),
+    "policy": Setting("SKILLGUARD_POLICY", str, "",
+                      "Policy file (TOML) with suppressions and approvals; empty = none"),
     # --- Limits ----------------------------------------------------------------------------------------
     "max_file_bytes": Setting("SKILLGUARD_MAX_FILE_BYTES", int, 2_000_000,
                               "Text files larger than this are not inspected (reported as a coverage gap)"),
@@ -96,6 +107,7 @@ class Settings:
     llm_retries: int
     review_max_tokens: int
     max_prompt_chars: int
+    max_review_calls: int
     jev_base_url: str
     jev_api_key: str
     use_llm: bool
@@ -105,6 +117,9 @@ class Settings:
     cisco_timeout: float
     keep_threshold: float
     drop_threshold: float
+    cache_dir: str
+    cache_ttl_days: float
+    policy: str
     max_file_bytes: int
     workers: int
 
@@ -122,6 +137,14 @@ class Settings:
         if self.base_url:
             return self.base_url.rstrip("/")
         return OPENROUTER_URL if self.backend == "openrouter" else ""
+
+    @property
+    def effective_cache_dir(self) -> Path | None:
+        if self.cache_dir.strip().lower() in ("none", "off", "false"):
+            return None
+        if self.cache_dir:
+            return Path(self.cache_dir).expanduser()
+        return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "skillguard"
 
     @property
     def effective_jev_api_key(self) -> str:
@@ -208,11 +231,13 @@ def validate(settings: Settings) -> None:
     for name in ("keep_threshold", "drop_threshold"):
         if not 0 <= getattr(settings, name) <= 1:
             raise ConfigError(f"{SETTINGS[name].env} must be between 0 and 1")
-    for name in ("llm_retries", "review_max_tokens", "max_prompt_chars", "max_file_bytes", "workers"):
+    for name in ("llm_retries", "review_max_tokens", "max_prompt_chars", "max_review_calls", "max_file_bytes", "workers"):
         if getattr(settings, name) < 1:
             raise ConfigError(f"{SETTINGS[name].env} must be at least 1")
     if settings.max_prompt_chars < 50_000:
         raise ConfigError("SKILLGUARD_MAX_PROMPT_CHARS must be at least 50000")
+    if settings.cache_ttl_days < 0:
+        raise ConfigError("SKILLGUARD_CACHE_TTL_DAYS must not be negative")
     settings.temperature_value  # noqa: B018 - validates the value
 
 
